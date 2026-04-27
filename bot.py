@@ -5,6 +5,8 @@ import logging
 import asyncio
 import random
 import threading
+import gc
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from threading import Lock
@@ -18,7 +20,7 @@ from telegram.ext import (
     filters, ContextTypes, JobQueue
 )
 
-# ---------- Flask for Render ----------
+# ---------- Flask for Render (keep‑alive) ----------
 PORT = int(os.environ.get("PORT", 8080))
 flask_app = Flask(__name__)
 
@@ -29,15 +31,14 @@ def home():
 def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
-# Start Flask in a background thread
 threading.Thread(target=run_flask, daemon=True).start()
 
 # ---------- Configuration ----------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("No TELEGRAM_BOT_TOKEN set")
+    raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set! Please add it in Render dashboard.")
 
-ADMIN_IDS = [5936431184, 8431995898]
+ADMIN_IDS = [5936431184, 8431995898]   # Replace with your admin user IDs
 ORIGINAL_ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
 
 CHANNELS = [
@@ -45,8 +46,9 @@ CHANNELS = [
 ]
 
 # ---------- Logging ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 # ---------- Data File ----------
 DATA_FILE = "userdata.txt"
@@ -274,14 +276,33 @@ class BotData:
     def get_all_user_ids(self) -> List[int]:
         return [int(uid) for uid in self.data["users"].keys()]
 
-# ---------- Force Join Cache ----------
-join_cache = {}
+# ---------- Force Join Cache (LRU) ----------
+class LRUCache:
+    def __init__(self, maxsize=500):
+        self.cache = OrderedDict()
+        self.maxsize = maxsize
+    def get(self, key):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return None
+    def set(self, key, value):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        if len(self.cache) > self.maxsize:
+            self.cache.popitem(last=False)
+    def clear(self):
+        self.cache.clear()
+
+join_cache = LRUCache(maxsize=500)
 JOIN_CACHE_TTL = 30
 
 async def is_user_member_of_channels(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     now = datetime.now().timestamp()
-    if user_id in join_cache and (now - join_cache[user_id][0]) < JOIN_CACHE_TTL:
-        return all(join_cache[user_id][1].values())
+    cached = join_cache.get(user_id)
+    if cached and (now - cached[0]) < JOIN_CACHE_TTL:
+        return all(cached[1].values())
     status = {}
     for ch in CHANNELS:
         try:
@@ -289,7 +310,7 @@ async def is_user_member_of_channels(user_id: int, context: ContextTypes.DEFAULT
             status[ch["id"]] = member.status in ["member", "administrator", "creator"]
         except Exception:
             status[ch["id"]] = False
-    join_cache[user_id] = (now, status)
+    join_cache.set(user_id, (now, status))
     return all(status.values())
 
 # ---------- Async Jio Checker ----------
@@ -519,7 +540,7 @@ async def claimcode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     context.user_data["expecting_code"] = True
 
-# Button callbacks (same as before)
+# Button callbacks (actions)
 async def balance_action(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
     user_id = query.from_user.id
     user = data_manager.get_user(user_id)
@@ -600,6 +621,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_force_join_prompt(update, context)
         return
 
+    # Expecting gift code?
     if context.user_data.get("expecting_code"):
         if re.fullmatch(r"\d{10}", user_input):
             success = data_manager.claim_gift_code(user_input, user_id)
@@ -613,6 +635,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_main_menu(update, context)
         return
 
+    # Expecting number for Jio check?
     if context.user_data.get("expecting_number"):
         if re.fullmatch(r"\d{10}", user_input):
             user = data_manager.get_user(user_id)
@@ -657,6 +680,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_main_menu(update, context)
         return
 
+    # If nothing else, show menu
     await update.message.reply_text("🤔 Use the buttons below.", reply_markup=main_menu_keyboard())
 
 async def show_force_join_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -672,8 +696,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-
     user_id = query.from_user.id
+
+    # Force join check for all actions except the check itself
     if data != "force_join_check" and not data_manager.is_admin(user_id):
         if not await is_user_member_of_channels(user_id, context):
             keyboard = [[InlineKeyboardButton("🔓 Join Channel", url=ch["link"])] for ch in CHANNELS]
@@ -696,7 +721,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "action_buy":
         await buy_action(update, context, query)
     elif data == "action_help":
-        await help_command(update, context)
+        await help_command(update, context)  # help_command handles both callback and text
     elif data == "action_jiomart":
         await jiomart_action(update, context, query)
     elif data.startswith("buy_"):
@@ -894,6 +919,7 @@ async def handle_restore_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             new_data = json.load(f)
     data_manager.data = new_data
     data_manager._ensure_structure()
+    # Recalculate credits for all users
     for uid_str, user in data_manager.data["users"].items():
         user["credits"] = data_manager._total_credits(user)
     data_manager.save()
@@ -942,8 +968,14 @@ async def check_expirations(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+async def gc_job(context: ContextTypes.DEFAULT_TYPE):
+    gc.collect()
+    logger.info("Garbage collection executed")
+
 # ---------- Main ----------
 def main():
+    # Start with clean cache and GC
+    gc.collect()
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Text commands
@@ -979,8 +1011,9 @@ def main():
         job_queue.run_repeating(periodic_save_job, interval=SAVE_INTERVAL_SECONDS, first=10)
         job_queue.run_repeating(hourly_admin_update, interval=3600, first=60)
         job_queue.run_daily(check_expirations, time=datetime.strptime("10:00", "%H:%M").time())
+        job_queue.run_repeating(gc_job, interval=3600, first=3600)   # GC every hour
 
-    logger.info("Bot started with Flask keep‑alive and all features.")
+    logger.info("Bot started with all optimisations.")
     app.run_polling()
 
 if __name__ == "__main__":
