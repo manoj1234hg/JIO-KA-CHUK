@@ -20,7 +20,7 @@ from telegram.ext import (
     filters, ContextTypes, JobQueue
 )
 
-# ---------- Flask for Render (keep‑alive) ----------
+# ---------- Flask for Render ----------
 PORT = int(os.environ.get("PORT", 8080))
 flask_app = Flask(__name__)
 
@@ -36,13 +36,13 @@ threading.Thread(target=run_flask, daemon=True).start()
 # ---------- Configuration ----------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set! Please add it in Render dashboard.")
+    raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set!")
 
 ADMIN_IDS = [5936431184, 8431995898]   # Replace with your admin user IDs
 ORIGINAL_ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
 
 CHANNELS = [
-    {"id": -1003663859246, "link": "https://t.me/jiomartnumberchecker"}
+    {"id": -1003729057004, "link": "https://t.me/esdiekidrav_gateways"}
 ]
 
 # ---------- Logging ----------
@@ -298,11 +298,15 @@ class LRUCache:
 join_cache = LRUCache(maxsize=500)
 JOIN_CACHE_TTL = 30
 
-async def is_user_member_of_channels(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    now = datetime.now().timestamp()
-    cached = join_cache.get(user_id)
-    if cached and (now - cached[0]) < JOIN_CACHE_TTL:
-        return all(cached[1].values())
+async def is_user_member_of_channels(user_id: int, context: ContextTypes.DEFAULT_TYPE, force_refresh: bool = False) -> bool:
+    """Check if user is member of all required channels.
+    If force_refresh is True, ignore cache and fetch fresh data."""
+    if not force_refresh:
+        now = datetime.now().timestamp()
+        cached = join_cache.get(user_id)
+        if cached and (now - cached[0]) < JOIN_CACHE_TTL:
+            return all(cached[1].values())
+    # Fresh check
     status = {}
     for ch in CHANNELS:
         try:
@@ -310,7 +314,8 @@ async def is_user_member_of_channels(user_id: int, context: ContextTypes.DEFAULT
             status[ch["id"]] = member.status in ["member", "administrator", "creator"]
         except Exception:
             status[ch["id"]] = False
-    join_cache.set(user_id, (now, status))
+    # Update cache (even if forced, we cache the fresh result)
+    join_cache.set(user_id, (datetime.now().timestamp(), status))
     return all(status.values())
 
 # ---------- Async Jio Checker ----------
@@ -444,7 +449,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Send a **10-digit number** to check Jio status.\n"
             "• Use the buttons below to navigate.\n\n"
             "*Admin commands:* (text only)\n"
-            "/gengiftcode, /codestats, /delcode, /addcredit, /removecredit, /addadmin, /broadcast, /backup, /restore, /stats"
+            "/gengiftcode, /codestats, /delcode, /addcredit, /removecredit, /addadmin, /broadcast, /backup, /sendbackup, /restore, /stats"
         )
         await query.edit_message_text(help_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
@@ -459,7 +464,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Send a **10-digit number** to check Jio status.\n"
             "• Use the buttons below to navigate.\n\n"
             "*Admin commands:* (text only)\n"
-            "/gengiftcode, /codestats, /delcode, /addcredit, /removecredit, /addadmin, /broadcast, /backup, /restore, /stats"
+            "/gengiftcode, /codestats, /delcode, /addcredit, /removecredit, /addadmin, /broadcast, /backup, /sendbackup, /restore, /stats"
         )
         await update.message.reply_text(help_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
@@ -721,7 +726,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "action_buy":
         await buy_action(update, context, query)
     elif data == "action_help":
-        await help_command(update, context)  # help_command handles both callback and text
+        await help_command(update, context)
     elif data == "action_jiomart":
         await jiomart_action(update, context, query)
     elif data.startswith("buy_"):
@@ -752,7 +757,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
         )
     elif data == "force_join_check":
-        if await is_user_member_of_channels(user_id, context):
+        # Force fresh check (ignore cache)
+        if await is_user_member_of_channels(user_id, context, force_refresh=True):
+            # Clear cache for this user to be safe
+            join_cache.set(user_id, (datetime.now().timestamp(), {ch["id"]: True for ch in CHANNELS}))
             await query.edit_message_text("✅ Thank you for joining! You can now use the bot.")
             await show_main_menu(update, context, query=query)
         else:
@@ -899,6 +907,12 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(DATA_FILE, "rb") as f:
         await update.message.reply_document(f, filename="userdata_backup.json")
 
+async def sendbackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_check(update):
+        return
+    await send_backup_to_admins(context.bot)
+    await update.message.reply_text("Backup sent to all admins.")
+
 async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_check(update):
         return
@@ -919,7 +933,6 @@ async def handle_restore_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             new_data = json.load(f)
     data_manager.data = new_data
     data_manager._ensure_structure()
-    # Recalculate credits for all users
     for uid_str, user in data_manager.data["users"].items():
         user["credits"] = data_manager._total_credits(user)
     data_manager.save()
@@ -935,6 +948,28 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subs = sum(1 for u in users.values() if u.get("subscription_end") and datetime.fromtimestamp(u["subscription_end"]) > datetime.now())
     await update.message.reply_text(f"📊 *Stats*\nUsers: {total}\nActive codes: {active_codes}\nCredits: {total_credits}\nSubscriptions: {subs}", parse_mode="Markdown")
 
+# ---------- Automatic Hourly Backup ----------
+async def send_backup_to_admins(bot):
+    data_manager.save()
+    try:
+        with open(DATA_FILE, "rb") as f:
+            for admin_id in data_manager.data.get("admins", []):
+                try:
+                    await bot.send_document(
+                        chat_id=admin_id,
+                        document=f,
+                        filename=f"userdata_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        caption="📦 Automatic hourly backup"
+                    )
+                    f.seek(0)
+                except Exception as e:
+                    logger.error(f"Failed to send backup to admin {admin_id}: {e}")
+    except Exception as e:
+        logger.error(f"Backup send error: {e}")
+
+async def hourly_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    await send_backup_to_admins(context.bot)
+
 # ---------- Periodic Jobs ----------
 async def periodic_save_job(context: ContextTypes.DEFAULT_TYPE):
     await data_manager.periodic_save()
@@ -946,7 +981,7 @@ async def hourly_admin_update(context: ContextTypes.DEFAULT_TYPE):
     total = len(users)
     active_codes = len(data_manager.get_active_codes())
     subs = sum(1 for u in users.values() if u.get("subscription_end") and datetime.fromtimestamp(u["subscription_end"]) > datetime.now())
-    msg = f"⏰ *Hourly*\nUsers: {total}\nCodes: {active_codes}\nSubs: {subs}"
+    msg = f"⏰ *Hourly Stats*\nUsers: {total}\nCodes: {active_codes}\nSubscriptions: {subs}"
     for aid in data_manager.data["admins"]:
         try:
             await context.bot.send_message(aid, msg, parse_mode="Markdown")
@@ -974,11 +1009,10 @@ async def gc_job(context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Main ----------
 def main():
-    # Start with clean cache and GC
     gc.collect()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Text commands
+    # User commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("balance", balance_command))
@@ -995,6 +1029,7 @@ def main():
     app.add_handler(CommandHandler("addcredit", addcredit))
     app.add_handler(CommandHandler("removecredit", removecredit))
     app.add_handler(CommandHandler("backup", backup))
+    app.add_handler(CommandHandler("sendbackup", sendbackup))
     app.add_handler(CommandHandler("restore", restore))
     app.add_handler(CommandHandler("stats", stats))
 
@@ -1010,10 +1045,11 @@ def main():
     if job_queue:
         job_queue.run_repeating(periodic_save_job, interval=SAVE_INTERVAL_SECONDS, first=10)
         job_queue.run_repeating(hourly_admin_update, interval=3600, first=60)
+        job_queue.run_repeating(hourly_backup_job, interval=3600, first=3600)
         job_queue.run_daily(check_expirations, time=datetime.strptime("10:00", "%H:%M").time())
-        job_queue.run_repeating(gc_job, interval=3600, first=3600)   # GC every hour
+        job_queue.run_repeating(gc_job, interval=3600, first=3600)
 
-    logger.info("Bot started with all optimisations.")
+    logger.info("Bot started with instant force-join verification.")
     app.run_polling()
 
 if __name__ == "__main__":
