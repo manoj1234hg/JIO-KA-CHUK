@@ -42,7 +42,7 @@ ADMIN_IDS = [5936431184, 8431995898]   # Replace with your admin user IDs
 ORIGINAL_ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
 
 CHANNELS = [
-    {"id": -1003729057004, "link": "https://t.me/esdiekidrav_gateways"}
+    {"id": -1003663859246, "link": "https://t.me/jiomartnumberchecker"}
 ]
 
 # ---------- Logging ----------
