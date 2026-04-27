@@ -20,7 +20,7 @@ from telegram.ext import (
     filters, ContextTypes, JobQueue
 )
 
-# ---------- Flask for Render ----------
+# ---------- Flask for Render (keep‑alive) ----------
 PORT = int(os.environ.get("PORT", 8080))
 flask_app = Flask(__name__)
 
@@ -36,7 +36,7 @@ threading.Thread(target=run_flask, daemon=True).start()
 # ---------- Configuration ----------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set!")
+    raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set! Please add it in Render dashboard.")
 
 ADMIN_IDS = [5936431184, 8431995898]   # Replace with your admin user IDs
 ORIGINAL_ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
@@ -86,6 +86,21 @@ class BotData:
         for aid in ADMIN_IDS:
             if aid not in self.data["admins"]:
                 self.data["admins"].append(aid)
+        # Add missing fields for existing users
+        for uid, user in self.data["users"].items():
+            if "subscription_start" not in user:
+                user["subscription_start"] = None
+            if "subscription_duration" not in user:
+                user["subscription_duration"] = 0
+            if "notified_60pct" not in user:
+                user["notified_60pct"] = False
+            for days in [10,5,3,2,1]:
+                if f"notified_{days}d" not in user:
+                    user[f"notified_{days}d"] = False
+            if "notified_last_day" not in user:
+                user["notified_last_day"] = False
+            if "last_credit_notify" not in user:
+                user["last_credit_notify"] = 0
         self._mark_dirty()
 
     def _mark_dirty(self):
@@ -119,9 +134,15 @@ class BotData:
                 "referral_count": 0,
                 "referred_by": None,
                 "subscription_end": None,
+                "subscription_start": None,
+                "subscription_duration": 0,
                 "claimed_gifts": [],
                 "total_referrals_given": 0,
-                "join_date": datetime.now().timestamp()
+                "join_date": datetime.now().timestamp(),
+                "notified_60pct": False,
+                "notified_10d": False, "notified_5d": False, "notified_3d": False,
+                "notified_2d": False, "notified_1d": False, "notified_last_day": False,
+                "last_credit_notify": 0
             }
             self._mark_dirty()
         return self.data["users"][uid]
@@ -191,7 +212,12 @@ class BotData:
             new_end = max(current_end, now) + duration
         else:
             new_end = now + duration
+            user["subscription_start"] = now.timestamp()
+            user["subscription_duration"] = duration.total_seconds()
         user["subscription_end"] = new_end.timestamp()
+        if user["subscription_start"]:
+            total_seconds = new_end.timestamp() - user["subscription_start"]
+            user["subscription_duration"] = total_seconds
         self._mark_dirty()
 
     def has_active_subscription(self, user_id: int) -> bool:
@@ -200,6 +226,24 @@ class BotData:
             return False
         return datetime.fromtimestamp(user["subscription_end"]) > datetime.now()
 
+    def get_subscription_remaining(self, user_id: int) -> Tuple[bool, Optional[timedelta], Optional[float]]:
+        user = self.get_user(user_id)
+        if not user["subscription_end"]:
+            return False, None, None
+        now = datetime.now()
+        end = datetime.fromtimestamp(user["subscription_end"])
+        if now >= end:
+            return False, None, 100.0
+        remaining = end - now
+        percent_used = 0
+        if user["subscription_start"] and user["subscription_duration"]:
+            start = datetime.fromtimestamp(user["subscription_start"])
+            total_seconds = user["subscription_duration"]
+            elapsed = (now - start).total_seconds()
+            percent_used = (elapsed / total_seconds) * 100 if total_seconds > 0 else 0
+        return True, remaining, percent_used
+
+    # Gift codes
     def generate_gift_code(self, code: str, duration: timedelta):
         self.data["gift_codes"][code] = {
             "duration_seconds": duration.total_seconds(),
@@ -231,6 +275,7 @@ class BotData:
             if user_id:
                 user = self.get_user(user_id)
                 user["subscription_end"] = None
+                user["subscription_start"] = None
                 self._mark_dirty()
         self._mark_dirty()
         return True
@@ -238,6 +283,7 @@ class BotData:
     def get_active_codes(self) -> List[Tuple[str, dict]]:
         return [(c, info) for c, info in self.data["gift_codes"].items() if not info["claimed"]]
 
+    # Referrals
     def process_referral(self, new_user_id: int, referrer_id: Optional[int]) -> bool:
         if referrer_id is None or referrer_id == new_user_id:
             return False
@@ -261,16 +307,6 @@ class BotData:
                 expiry = datetime.fromtimestamp(batch["expires"])
                 if now < expiry <= threshold and batch["amount"] > 0:
                     result.append((uid, batch["amount"], expiry))
-        return result
-
-    def get_expiring_subscriptions(self, days_before: int = 10) -> List[Tuple[int, datetime]]:
-        result = []
-        for uid_str, user in self.data["users"].items():
-            if user["subscription_end"]:
-                expiry = datetime.fromtimestamp(user["subscription_end"])
-                now = datetime.now()
-                if now < expiry <= now + timedelta(days=days_before):
-                    result.append((int(uid_str), expiry))
         return result
 
     def get_all_user_ids(self) -> List[int]:
@@ -299,14 +335,11 @@ join_cache = LRUCache(maxsize=500)
 JOIN_CACHE_TTL = 30
 
 async def is_user_member_of_channels(user_id: int, context: ContextTypes.DEFAULT_TYPE, force_refresh: bool = False) -> bool:
-    """Check if user is member of all required channels.
-    If force_refresh is True, ignore cache and fetch fresh data."""
     if not force_refresh:
         now = datetime.now().timestamp()
         cached = join_cache.get(user_id)
         if cached and (now - cached[0]) < JOIN_CACHE_TTL:
             return all(cached[1].values())
-    # Fresh check
     status = {}
     for ch in CHANNELS:
         try:
@@ -314,7 +347,6 @@ async def is_user_member_of_channels(user_id: int, context: ContextTypes.DEFAULT
             status[ch["id"]] = member.status in ["member", "administrator", "creator"]
         except Exception:
             status[ch["id"]] = False
-    # Update cache (even if forced, we cache the fresh result)
     join_cache.set(user_id, (datetime.now().timestamp(), status))
     return all(status.values())
 
@@ -375,11 +407,16 @@ async def get_user_status_text(user_id: int) -> str:
     if free_left < 0:
         free_left = 0
     referral_count = user["referral_count"]
-    sub_active = data_manager.has_active_subscription(user_id)
-    sub_text = "✅ Active" if sub_active else "❌ Inactive"
-    if user["subscription_end"] and not sub_active:
-        expiry = datetime.fromtimestamp(user["subscription_end"]).strftime("%Y-%m-%d")
-        sub_text = f"❌ Expired on {expiry}"
+    active, remaining, _ = data_manager.get_subscription_remaining(user_id)
+    if active:
+        if remaining.days > 0:
+            time_left = f"{remaining.days} days"
+        else:
+            hours = remaining.seconds // 3600
+            time_left = f"{hours} hours"
+        sub_text = f"✅ Active (expires in {time_left})"
+    else:
+        sub_text = "❌ Inactive"
     status = (
         f"🌟 *𝗝𝗜𝗢𝗠𝗔𝗥𝗧 𝗡𝗨𝗠𝗕𝗘𝗥 𝗖𝗛𝗘𝗖𝗞𝗘𝗥*\n"
         f"👤 *User Dashboard*\n"
@@ -473,16 +510,16 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data_manager.is_admin(user_id) and not await is_user_member_of_channels(user_id, context):
         await show_force_join_prompt(update, context)
         return
+    active, remaining, _ = data_manager.get_subscription_remaining(user_id)
     user = data_manager.get_user(user_id)
     credits = user["credits"]
-    sub_end = user["subscription_end"]
-    sub_text = "Unlimited ✅" if data_manager.has_active_subscription(user_id) else "Inactive ❌"
-    if sub_end and not data_manager.has_active_subscription(user_id):
-        end_date = datetime.fromtimestamp(sub_end).strftime("%Y-%m-%d")
-        sub_text = f"Expired on {end_date} ❌"
-    elif sub_end:
-        end_date = datetime.fromtimestamp(sub_end).strftime("%Y-%m-%d")
-        sub_text += f" (until {end_date})"
+    sub_text = "Unlimited ✅" if active else "Inactive ❌"
+    if active:
+        if remaining.days > 0:
+            sub_text += f" (expires in {remaining.days} days)"
+        else:
+            hours = remaining.seconds // 3600
+            sub_text += f" (expires in {hours} hours)"
     text = (
         f"💰 *Your Balance*\n\n"
         f"💎 Credits: `{credits}`\n"
@@ -545,19 +582,19 @@ async def claimcode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     context.user_data["expecting_code"] = True
 
-# Button callbacks (actions)
+# ---------- Button Callbacks ----------
 async def balance_action(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
     user_id = query.from_user.id
+    active, remaining, _ = data_manager.get_subscription_remaining(user_id)
     user = data_manager.get_user(user_id)
     credits = user["credits"]
-    sub_end = user["subscription_end"]
-    sub_text = "Unlimited ✅" if data_manager.has_active_subscription(user_id) else "Inactive ❌"
-    if sub_end and not data_manager.has_active_subscription(user_id):
-        end_date = datetime.fromtimestamp(sub_end).strftime("%Y-%m-%d")
-        sub_text = f"Expired on {end_date} ❌"
-    elif sub_end:
-        end_date = datetime.fromtimestamp(sub_end).strftime("%Y-%m-%d")
-        sub_text += f" (until {end_date})"
+    sub_text = "Unlimited ✅" if active else "Inactive ❌"
+    if active:
+        if remaining.days > 0:
+            sub_text += f" (expires in {remaining.days} days)"
+        else:
+            hours = remaining.seconds // 3600
+            sub_text += f" (expires in {hours} hours)"
     text = (
         f"💰 *Your Balance*\n\n"
         f"💎 Credits: `{credits}`\n"
@@ -626,7 +663,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_force_join_prompt(update, context)
         return
 
-    # Expecting gift code?
     if context.user_data.get("expecting_code"):
         if re.fullmatch(r"\d{10}", user_input):
             success = data_manager.claim_gift_code(user_input, user_id)
@@ -640,7 +676,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_main_menu(update, context)
         return
 
-    # Expecting number for Jio check?
     if context.user_data.get("expecting_number"):
         if re.fullmatch(r"\d{10}", user_input):
             user = data_manager.get_user(user_id)
@@ -685,7 +720,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_main_menu(update, context)
         return
 
-    # If nothing else, show menu
     await update.message.reply_text("🤔 Use the buttons below.", reply_markup=main_menu_keyboard())
 
 async def show_force_join_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -703,7 +737,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = query.from_user.id
 
-    # Force join check for all actions except the check itself
     if data != "force_join_check" and not data_manager.is_admin(user_id):
         if not await is_user_member_of_channels(user_id, context):
             keyboard = [[InlineKeyboardButton("🔓 Join Channel", url=ch["link"])] for ch in CHANNELS]
@@ -757,9 +790,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
         )
     elif data == "force_join_check":
-        # Force fresh check (ignore cache)
         if await is_user_member_of_channels(user_id, context, force_refresh=True):
-            # Clear cache for this user to be safe
             join_cache.set(user_id, (datetime.now().timestamp(), {ch["id"]: True for ch in CHANNELS}))
             await query.edit_message_text("✅ Thank you for joining! You can now use the bot.")
             await show_main_menu(update, context, query=query)
@@ -948,20 +979,27 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subs = sum(1 for u in users.values() if u.get("subscription_end") and datetime.fromtimestamp(u["subscription_end"]) > datetime.now())
     await update.message.reply_text(f"📊 *Stats*\nUsers: {total}\nActive codes: {active_codes}\nCredits: {total_credits}\nSubscriptions: {subs}", parse_mode="Markdown")
 
-# ---------- Automatic Hourly Backup ----------
+# ---------- Automatic Backup ----------
 async def send_backup_to_admins(bot):
-    data_manager.save()
+    """Save data and send the backup file to all admins."""
+    data_manager.save()  # ensure latest data is on disk
+    if not os.path.exists(DATA_FILE):
+        logger.error("Backup failed: data file missing")
+        return
     try:
         with open(DATA_FILE, "rb") as f:
             for admin_id in data_manager.data.get("admins", []):
                 try:
+                    # Create filename with timestamp
+                    filename = f"userdata_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
                     await bot.send_document(
                         chat_id=admin_id,
                         document=f,
-                        filename=f"userdata_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        filename=filename,
                         caption="📦 Automatic hourly backup"
                     )
-                    f.seek(0)
+                    f.seek(0)  # rewind for next admin
+                    await asyncio.sleep(0.1)
                 except Exception as e:
                     logger.error(f"Failed to send backup to admin {admin_id}: {e}")
     except Exception as e:
@@ -969,6 +1007,69 @@ async def send_backup_to_admins(bot):
 
 async def hourly_backup_job(context: ContextTypes.DEFAULT_TYPE):
     await send_backup_to_admins(context.bot)
+
+# ---------- Expiry Notifications ----------
+async def check_subscription_expirations(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now()
+    for uid_str, user in data_manager.data["users"].items():
+        uid = int(uid_str)
+        end_ts = user.get("subscription_end")
+        if not end_ts:
+            continue
+        end = datetime.fromtimestamp(end_ts)
+        if now >= end:
+            continue
+        remaining = end - now
+        days_left = remaining.days
+        percent_used = 0
+        if user.get("subscription_start") and user.get("subscription_duration"):
+            start = datetime.fromtimestamp(user["subscription_start"])
+            total = user["subscription_duration"]
+            elapsed = (now - start).total_seconds()
+            percent_used = (elapsed / total) * 100 if total > 0 else 0
+        send_notify = False
+        message = ""
+        # 60% notification (once)
+        if percent_used >= 60 and not user.get("notified_60pct"):
+            user["notified_60pct"] = True
+            send_notify = True
+            message = f"⚠️ *60% of your subscription period has passed!* You have {remaining.days} days left. Renew soon to avoid interruption."
+        # Specific days left reminders
+        elif days_left in [10,5,3,2,1] and not user.get(f"notified_{days_left}d"):
+            user[f"notified_{days_left}d"] = True
+            send_notify = True
+            message = f"⏰ *Your subscription expires in {days_left} days!* Please renew via /buy to continue enjoying unlimited checks."
+        elif days_left == 0 and remaining.seconds <= 86400 and not user.get("notified_last_day"):
+            user["notified_last_day"] = True
+            send_notify = True
+            message = "⚠️ *Your subscription ends TODAY!* Renew immediately to keep using unlimited checks."
+        if send_notify:
+            try:
+                await context.bot.send_message(uid, message, parse_mode="Markdown")
+                data_manager._mark_dirty()
+            except Exception:
+                pass
+    data_manager.save()
+
+async def check_credit_expirations(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now()
+    expiring = data_manager.get_expiring_credits(10)
+    for uid, amount, expiry in expiring:
+        days = (expiry - now).days
+        user = data_manager.get_user(uid)
+        last_notify = user.get("last_credit_notify", 0)
+        if now.timestamp() - last_notify > 86400:  # once per day
+            try:
+                await context.bot.send_message(
+                    uid,
+                    f"⚠️ *Credit Expiry Warning*\n{amount} credit(s) will expire on {expiry.strftime('%Y-%m-%d')} (in {days} days).\nUse them before they expire!",
+                    parse_mode="Markdown"
+                )
+                user["last_credit_notify"] = now.timestamp()
+                data_manager._mark_dirty()
+            except Exception:
+                pass
+    data_manager.save()
 
 # ---------- Periodic Jobs ----------
 async def periodic_save_job(context: ContextTypes.DEFAULT_TYPE):
@@ -985,21 +1086,6 @@ async def hourly_admin_update(context: ContextTypes.DEFAULT_TYPE):
     for aid in data_manager.data["admins"]:
         try:
             await context.bot.send_message(aid, msg, parse_mode="Markdown")
-        except Exception:
-            pass
-
-async def check_expirations(context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now()
-    for uid, amt, exp in data_manager.get_expiring_credits(10):
-        days = (exp - now).days
-        try:
-            await context.bot.send_message(uid, f"⚠️ {amt} credit(s) expire in {days} days.", parse_mode="Markdown")
-        except Exception:
-            pass
-    for uid, exp in data_manager.get_expiring_subscriptions(10):
-        days = (exp - now).days
-        try:
-            await context.bot.send_message(uid, f"⚠️ Subscription expires in {days} days. Renew with /buy.", parse_mode="Markdown")
         except Exception:
             pass
 
@@ -1045,11 +1131,12 @@ def main():
     if job_queue:
         job_queue.run_repeating(periodic_save_job, interval=SAVE_INTERVAL_SECONDS, first=10)
         job_queue.run_repeating(hourly_admin_update, interval=3600, first=60)
-        job_queue.run_repeating(hourly_backup_job, interval=3600, first=3600)
-        job_queue.run_daily(check_expirations, time=datetime.strptime("10:00", "%H:%M").time())
+        job_queue.run_repeating(hourly_backup_job, interval=3600, first=3600)          # every hour
+        job_queue.run_repeating(check_subscription_expirations, interval=43200, first=60)  # twice daily
+        job_queue.run_repeating(check_credit_expirations, interval=86400, first=300)       # once daily
         job_queue.run_repeating(gc_job, interval=3600, first=3600)
 
-    logger.info("Bot started with instant force-join verification.")
+    logger.info("Bot started with fixed hourly backup, subscription time display, and smart reminders.")
     app.run_polling()
 
 if __name__ == "__main__":
