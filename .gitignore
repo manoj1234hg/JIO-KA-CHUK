@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+venv/
+env/
+.env
+
+# Data files (user data, backups)
+userdata.txt
+*.json
+
+# Logs
+*.log
+
+# IDE files
+.vscode/
+.idea/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Flask / temporary files
+instance/
+.webassets-cache
