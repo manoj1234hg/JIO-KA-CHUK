@@ -355,6 +355,7 @@ async def get_user_status_text(user_id: int) -> str:
         expiry = datetime.fromtimestamp(user["subscription_end"]).strftime("%Y-%m-%d")
         sub_text = f"❌ Expired on {expiry}"
     status = (
+        f"🌟 *𝗝𝗜𝗢𝗠𝗔𝗥𝗧 𝗡𝗨𝗠𝗕𝗘𝗥 𝗖𝗛𝗘𝗖𝗞𝗘𝗥*\n"
         f"👤 *User Dashboard*\n"
         f"💎 Credits: `{credits}`\n"
         f"🎁 Free searches left: `{free_left}`\n"
