@@ -20,7 +20,7 @@ from telegram.ext import (
     filters, ContextTypes, JobQueue
 )
 
-# ---------- Flask for Render (keep‑alive) ----------
+# ---------- Flask for Render ----------
 PORT = int(os.environ.get("PORT", 8080))
 flask_app = Flask(__name__)
 
@@ -36,7 +36,7 @@ threading.Thread(target=run_flask, daemon=True).start()
 # ---------- Configuration ----------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set! Please add it in Render dashboard.")
+    raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set!")
 
 ADMIN_IDS = [5936431184, 8431995898]   # Replace with your admin user IDs
 ORIGINAL_ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
@@ -86,7 +86,6 @@ class BotData:
         for aid in ADMIN_IDS:
             if aid not in self.data["admins"]:
                 self.data["admins"].append(aid)
-        # Add missing fields for existing users
         for uid, user in self.data["users"].items():
             if "subscription_start" not in user:
                 user["subscription_start"] = None
@@ -939,6 +938,7 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(f, filename="userdata_backup.json")
 
 async def sendbackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual backup to all admins."""
     if not await admin_check(update):
         return
     await send_backup_to_admins(context.bot)
@@ -979,24 +979,27 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subs = sum(1 for u in users.values() if u.get("subscription_end") and datetime.fromtimestamp(u["subscription_end"]) > datetime.now())
     await update.message.reply_text(f"📊 *Stats*\nUsers: {total}\nActive codes: {active_codes}\nCredits: {total_credits}\nSubscriptions: {subs}", parse_mode="Markdown")
 
-# ---------- Automatic Backup ----------
+# ---------- Automatic Backup (Fixed File Name & Caption) ----------
 async def send_backup_to_admins(bot):
-    """Save data and send the backup file to all admins."""
-    data_manager.save()  # ensure latest data is on disk
+    """Save data and send userdata_backup.json to all admins with stats caption."""
+    data_manager.save()  # flush latest data to disk
     if not os.path.exists(DATA_FILE):
         logger.error("Backup failed: data file missing")
         return
+    # Prepare caption with stats and timestamp
+    total_users = len(data_manager.data.get("users", {}))
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    caption = f"📦 Hourly Backup\nUsers: {total_users}\nTime: {current_time}"
     try:
         with open(DATA_FILE, "rb") as f:
             for admin_id in data_manager.data.get("admins", []):
                 try:
-                    # Create filename with timestamp
-                    filename = f"userdata_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                    # Always send with the exact filename userdata_backup.json
                     await bot.send_document(
                         chat_id=admin_id,
                         document=f,
-                        filename=filename,
-                        caption="📦 Automatic hourly backup"
+                        filename="userdata_backup.json",
+                        caption=caption
                     )
                     f.seek(0)  # rewind for next admin
                     await asyncio.sleep(0.1)
@@ -1029,12 +1032,10 @@ async def check_subscription_expirations(context: ContextTypes.DEFAULT_TYPE):
             percent_used = (elapsed / total) * 100 if total > 0 else 0
         send_notify = False
         message = ""
-        # 60% notification (once)
         if percent_used >= 60 and not user.get("notified_60pct"):
             user["notified_60pct"] = True
             send_notify = True
             message = f"⚠️ *60% of your subscription period has passed!* You have {remaining.days} days left. Renew soon to avoid interruption."
-        # Specific days left reminders
         elif days_left in [10,5,3,2,1] and not user.get(f"notified_{days_left}d"):
             user[f"notified_{days_left}d"] = True
             send_notify = True
@@ -1136,7 +1137,7 @@ def main():
         job_queue.run_repeating(check_credit_expirations, interval=86400, first=300)       # once daily
         job_queue.run_repeating(gc_job, interval=3600, first=3600)
 
-    logger.info("Bot started with fixed hourly backup, subscription time display, and smart reminders.")
+    logger.info("Bot started with fixed hourly backup (fixed filename and caption).")
     app.run_polling()
 
 if __name__ == "__main__":
