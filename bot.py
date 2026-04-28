@@ -48,7 +48,7 @@ CHANNELS = [
 # ---------- Logging ----------
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.INFO)   # Ensure we see backup logs
 
 # ---------- Data File ----------
 DATA_FILE = "userdata.txt"
@@ -242,7 +242,6 @@ class BotData:
             percent_used = (elapsed / total_seconds) * 100 if total_seconds > 0 else 0
         return True, remaining, percent_used
 
-    # Gift codes
     def generate_gift_code(self, code: str, duration: timedelta):
         self.data["gift_codes"][code] = {
             "duration_seconds": duration.total_seconds(),
@@ -282,7 +281,6 @@ class BotData:
     def get_active_codes(self) -> List[Tuple[str, dict]]:
         return [(c, info) for c, info in self.data["gift_codes"].items() if not info["claimed"]]
 
-    # Referrals
     def process_referral(self, new_user_id: int, referrer_id: Optional[int]) -> bool:
         if referrer_id is None or referrer_id == new_user_id:
             return False
@@ -311,7 +309,7 @@ class BotData:
     def get_all_user_ids(self) -> List[int]:
         return [int(uid) for uid in self.data["users"].keys()]
 
-# ---------- Force Join Cache (LRU) ----------
+# ---------- Force Join Cache ----------
 class LRUCache:
     def __init__(self, maxsize=500):
         self.cache = OrderedDict()
@@ -327,8 +325,6 @@ class LRUCache:
         self.cache[key] = value
         if len(self.cache) > self.maxsize:
             self.cache.popitem(last=False)
-    def clear(self):
-        self.cache.clear()
 
 join_cache = LRUCache(maxsize=500)
 JOIN_CACHE_TTL = 30
@@ -938,11 +934,10 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(f, filename="userdata_backup.json")
 
 async def sendbackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual backup to all admins."""
     if not await admin_check(update):
         return
     await send_backup_to_admins(context.bot)
-    await update.message.reply_text("Backup sent to all admins.")
+    await update.message.reply_text("✅ Backup sent to all admins.")
 
 async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_check(update):
@@ -967,7 +962,7 @@ async def handle_restore_file(update: Update, context: ContextTypes.DEFAULT_TYPE
     for uid_str, user in data_manager.data["users"].items():
         user["credits"] = data_manager._total_credits(user)
     data_manager.save()
-    await update.message.reply_text("Data restored.")
+    await update.message.reply_text("✅ Data restored.")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_check(update):
@@ -979,36 +974,44 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subs = sum(1 for u in users.values() if u.get("subscription_end") and datetime.fromtimestamp(u["subscription_end"]) > datetime.now())
     await update.message.reply_text(f"📊 *Stats*\nUsers: {total}\nActive codes: {active_codes}\nCredits: {total_credits}\nSubscriptions: {subs}", parse_mode="Markdown")
 
-# ---------- Automatic Backup (Fixed File Name & Caption) ----------
+# ---------- Automatic Backup (FIXED) ----------
 async def send_backup_to_admins(bot):
-    """Save data and send userdata_backup.json to all admins with stats caption."""
-    data_manager.save()  # flush latest data to disk
-    if not os.path.exists(DATA_FILE):
-        logger.error("Backup failed: data file missing")
-        return
-    # Prepare caption with stats and timestamp
-    total_users = len(data_manager.data.get("users", {}))
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    caption = f"📦 Hourly Backup\nUsers: {total_users}\nTime: {current_time}"
+    """Save and send userdata_backup.json to all admins with stats caption."""
     try:
+        # Force save latest data
+        data_manager.save()
+        if not os.path.exists(DATA_FILE):
+            logger.error("Backup failed: userdata.txt does not exist")
+            return
+
+        total_users = len(data_manager.data.get("users", {}))
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        caption = f"📦 Hourly Backup\nUsers: {total_users}\nTime: {current_time}"
+        admins = data_manager.data.get("admins", [])
+        if not admins:
+            logger.warning("No admins found to send backup")
+            return
+
+        logger.info(f"Sending hourly backup to {len(admins)} admins. Users: {total_users}")
         with open(DATA_FILE, "rb") as f:
-            for admin_id in data_manager.data.get("admins", []):
+            for admin_id in admins:
                 try:
-                    # Always send with the exact filename userdata_backup.json
                     await bot.send_document(
                         chat_id=admin_id,
                         document=f,
                         filename="userdata_backup.json",
                         caption=caption
                     )
-                    f.seek(0)  # rewind for next admin
-                    await asyncio.sleep(0.1)
+                    f.seek(0)  # important: rewind for next admin
+                    logger.info(f"Backup sent to admin {admin_id}")
                 except Exception as e:
                     logger.error(f"Failed to send backup to admin {admin_id}: {e}")
     except Exception as e:
-        logger.error(f"Backup send error: {e}")
+        logger.error(f"send_backup_to_admins error: {e}")
 
 async def hourly_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job that runs every hour to send backup to admins."""
+    logger.info("Running hourly backup job...")
     await send_backup_to_admins(context.bot)
 
 # ---------- Expiry Notifications ----------
@@ -1059,7 +1062,7 @@ async def check_credit_expirations(context: ContextTypes.DEFAULT_TYPE):
         days = (expiry - now).days
         user = data_manager.get_user(uid)
         last_notify = user.get("last_credit_notify", 0)
-        if now.timestamp() - last_notify > 86400:  # once per day
+        if now.timestamp() - last_notify > 86400:
             try:
                 await context.bot.send_message(
                     uid,
@@ -1132,12 +1135,25 @@ def main():
     if job_queue:
         job_queue.run_repeating(periodic_save_job, interval=SAVE_INTERVAL_SECONDS, first=10)
         job_queue.run_repeating(hourly_admin_update, interval=3600, first=60)
-        job_queue.run_repeating(hourly_backup_job, interval=3600, first=3600)          # every hour
-        job_queue.run_repeating(check_subscription_expirations, interval=43200, first=60)  # twice daily
-        job_queue.run_repeating(check_credit_expirations, interval=86400, first=300)       # once daily
+        # Run backup every hour (first run after 60 seconds)
+        job_queue.run_repeating(hourly_backup_job, interval=3600, first=60)
+        job_queue.run_repeating(check_subscription_expirations, interval=43200, first=60)
+        job_queue.run_repeating(check_credit_expirations, interval=86400, first=300)
         job_queue.run_repeating(gc_job, interval=3600, first=3600)
 
-    logger.info("Bot started with fixed hourly backup (fixed filename and caption).")
+    # Send startup message to all admins
+    async def startup_notification():
+        await asyncio.sleep(5)
+        for admin_id in data_manager.data.get("admins", []):
+            try:
+                await app.bot.send_message(admin_id, "🤖 *Bot started!*\nHourly backup job is active.", parse_mode="Markdown")
+                logger.info(f"Startup notification sent to admin {admin_id}")
+            except Exception as e:
+                logger.error(f"Could not send startup message to {admin_id}: {e}")
+    loop = asyncio.get_event_loop()
+    loop.create_task(startup_notification())
+
+    logger.info("Bot started with automatic hourly backup (file: userdata_backup.json) to all admins.")
     app.run_polling()
 
 if __name__ == "__main__":
