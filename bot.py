@@ -48,7 +48,7 @@ CHANNELS = [
 # ---------- Logging ----------
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)   # Ensure we see backup logs
+logger.setLevel(logging.INFO)
 
 # ---------- Data File ----------
 DATA_FILE = "userdata.txt"
@@ -974,16 +974,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subs = sum(1 for u in users.values() if u.get("subscription_end") and datetime.fromtimestamp(u["subscription_end"]) > datetime.now())
     await update.message.reply_text(f"📊 *Stats*\nUsers: {total}\nActive codes: {active_codes}\nCredits: {total_credits}\nSubscriptions: {subs}", parse_mode="Markdown")
 
-# ---------- Automatic Backup (FIXED) ----------
+# ---------- Automatic Backup ----------
 async def send_backup_to_admins(bot):
-    """Save and send userdata_backup.json to all admins with stats caption."""
     try:
-        # Force save latest data
         data_manager.save()
         if not os.path.exists(DATA_FILE):
             logger.error("Backup failed: userdata.txt does not exist")
             return
-
         total_users = len(data_manager.data.get("users", {}))
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         caption = f"📦 Hourly Backup\nUsers: {total_users}\nTime: {current_time}"
@@ -991,7 +988,6 @@ async def send_backup_to_admins(bot):
         if not admins:
             logger.warning("No admins found to send backup")
             return
-
         logger.info(f"Sending hourly backup to {len(admins)} admins. Users: {total_users}")
         with open(DATA_FILE, "rb") as f:
             for admin_id in admins:
@@ -1002,7 +998,7 @@ async def send_backup_to_admins(bot):
                         filename="userdata_backup.json",
                         caption=caption
                     )
-                    f.seek(0)  # important: rewind for next admin
+                    f.seek(0)
                     logger.info(f"Backup sent to admin {admin_id}")
                 except Exception as e:
                     logger.error(f"Failed to send backup to admin {admin_id}: {e}")
@@ -1010,7 +1006,6 @@ async def send_backup_to_admins(bot):
         logger.error(f"send_backup_to_admins error: {e}")
 
 async def hourly_backup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job that runs every hour to send backup to admins."""
     logger.info("Running hourly backup job...")
     await send_backup_to_admins(context.bot)
 
@@ -1097,6 +1092,14 @@ async def gc_job(context: ContextTypes.DEFAULT_TYPE):
     gc.collect()
     logger.info("Garbage collection executed")
 
+async def startup_notification(context: ContextTypes.DEFAULT_TYPE):
+    for admin_id in data_manager.data.get("admins", []):
+        try:
+            await context.bot.send_message(admin_id, "🤖 *Bot started!*\nHourly backup job is active.", parse_mode="Markdown")
+            logger.info(f"Startup notification sent to admin {admin_id}")
+        except Exception as e:
+            logger.error(f"Could not send startup message to {admin_id}: {e}")
+
 # ---------- Main ----------
 def main():
     gc.collect()
@@ -1135,23 +1138,12 @@ def main():
     if job_queue:
         job_queue.run_repeating(periodic_save_job, interval=SAVE_INTERVAL_SECONDS, first=10)
         job_queue.run_repeating(hourly_admin_update, interval=3600, first=60)
-        # Run backup every hour (first run after 60 seconds)
-        job_queue.run_repeating(hourly_backup_job, interval=3600, first=60)
-        job_queue.run_repeating(check_subscription_expirations, interval=43200, first=60)
-        job_queue.run_repeating(check_credit_expirations, interval=86400, first=300)
+        job_queue.run_repeating(hourly_backup_job, interval=3600, first=60)      # every hour
+        job_queue.run_repeating(check_subscription_expirations, interval=43200, first=60)  # twice daily
+        job_queue.run_repeating(check_credit_expirations, interval=86400, first=300)       # once daily
         job_queue.run_repeating(gc_job, interval=3600, first=3600)
-
-    # Send startup message to all admins
-    async def startup_notification():
-        await asyncio.sleep(5)
-        for admin_id in data_manager.data.get("admins", []):
-            try:
-                await app.bot.send_message(admin_id, "🤖 *Bot started!*\nHourly backup job is active.", parse_mode="Markdown")
-                logger.info(f"Startup notification sent to admin {admin_id}")
-            except Exception as e:
-                logger.error(f"Could not send startup message to {admin_id}: {e}")
-    loop = asyncio.get_event_loop()
-    loop.create_task(startup_notification())
+        # Send startup notification after 5 seconds
+        job_queue.run_once(startup_notification, when=5)
 
     logger.info("Bot started with automatic hourly backup (file: userdata_backup.json) to all admins.")
     app.run_polling()
