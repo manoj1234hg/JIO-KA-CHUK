@@ -245,7 +245,7 @@ def load_cookies(filepath):
     return None
 
 # ------------------------------------------------------------
-# SteamChecker class with fallback validation & robust API calls
+# SteamChecker class with advanced API calls (auto‑encoded token)
 # ------------------------------------------------------------
 class SteamChecker:
     def __init__(self, cookie_data, cookie_file_path, index):
@@ -344,6 +344,33 @@ class SteamChecker:
             pass
         return "?"
 
+    # Helper for retries
+    def _api_request(self, method, url, **kwargs):
+        """Make an API request with automatic token encoding and retries."""
+        # Always add token as query parameter (automatically encoded by requests)
+        params = kwargs.pop('params', {})
+        params['access_token'] = self.token
+        kwargs['params'] = params
+
+        retries = 3
+        delay = 1
+        for attempt in range(retries):
+            try:
+                resp = self.session.request(method, url, timeout=10, **kwargs)
+                if resp.status_code in (200, 204):
+                    return resp
+                # If we get a 401/403, no point retrying
+                if resp.status_code in (401, 403):
+                    break
+                time.sleep(delay)
+                delay *= 2
+            except requests.exceptions.RequestException:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(delay)
+                delay *= 2
+        return resp
+
     def check(self):
         self.steamid = self.extract_steamid()
         self.token = self.extract_token()
@@ -353,7 +380,7 @@ class SteamChecker:
         self.session.cookies.set('Steam_Language', 'english')
         sid_int = int(self.steamid)
 
-        # ---- Step 1: Try to load the profile page (most reliable check) ----
+        # ---- Step 1: Profile page (most reliable) ----
         profile_ok = False
         try:
             resp = self.session.get(
@@ -363,7 +390,7 @@ class SteamChecker:
             )
             if resp.status_code == 200:
                 profile_ok = True
-                # Extract username and level from profile if possible
+                # Extract username and level from profile
                 title_match = re.search(r'<title>(.*?)</title>', resp.text)
                 if title_match:
                     title = title_match.group(1)
@@ -373,7 +400,6 @@ class SteamChecker:
                         self.username = title.replace('Steam 社区 :: ', '').strip()
                     else:
                         self.username = title.strip()
-                # Try to get level from the page
                 level_match = re.search(r'level\s*(\d+)', resp.text, re.I)
                 if level_match:
                     self.level = level_match.group(1)
@@ -396,132 +422,22 @@ class SteamChecker:
         except:
             pass
 
-        # If profile page loaded, we already have a valid cookie.
-        # Now try to get additional info from APIs – using params to encode token properly.
-        if profile_ok:
-            try:
-                # Helper to make API requests with token as query param
-                def api_get(url, params=None, **kwargs):
-                    params = params or {}
-                    params['access_token'] = self.token
-                    return self.session.get(url, params=params, timeout=10, **kwargs)
-
-                def api_post(url, data=None, **kwargs):
-                    # For POST, we need to add token to URL
-                    sep = '&' if '?' in url else '?'
-                    url_with_token = f"{url}{sep}access_token={baro_enc.quote(self.token)}"
-                    return self.session.post(url_with_token, data=data, timeout=10, **kwargs)
-
-                # Get country
-                cpb = struct.pack('<BQ', 0x09, sid_int)
-                resp = api_post(
-                    "https://api.steampowered.com/IUserAccountService/GetUserCountry/v1",
-                    data=brn_mp("input_protobuf_encoded", base64.b64encode(cpb).decode()),
-                    headers={"Content-Type": BARON_CT}
-                )
-                if resp.status_code == 200:
-                    data = baron_pd(resp.content)
-                    cc = data.get(1, b"")
-                    if cc:
-                        if isinstance(cc, bytes):
-                            cc = cc.decode()
-                        self.country = BRN_MAP.get(cc, cc)
-
-                # Get games
-                gpb = (baro_pi(1, sid_int) + baro_pi(2, 1) + baro_pi(3, 1) +
-                       baro_pi(6, 0) + baro_ps(7, "english") + baro_pi(8, 1) +
-                       baro_pi(9, 1) + baro_pi(10, 1))
-                gb64 = baro_enc.quote(base64.b64encode(gpb).decode())
-                resp = api_get(
-                    "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1",
-                    params={"input_protobuf_encoded": gb64}
-                )
-                if resp.status_code == 200:
-                    data = baron_pd(resp.content)
-                    self.total_games = data.get(1, 0)
-                    raw_games = data.get(2, [])
-                    if isinstance(raw_games, bytes):
-                        raw_games = [raw_games]
-                    elif not isinstance(raw_games, list):
-                        raw_games = []
-                    for g in raw_games:
-                        try:
-                            if not isinstance(g, bytes):
-                                continue
-                            gf = baron_pd(g)
-                            name = gf.get(2, b"")
-                            if isinstance(name, bytes):
-                                name = name.decode(errors="replace")
-                            if isinstance(name, str) and name.strip():
-                                self.games.append(name.strip())
-                        except:
-                            continue
-
-                # Get balance
-                resp = api_post(
-                    "https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1",
-                    data=brn_mp("input_protobuf_encoded", "GAE="),
-                    headers={"Content-Type": BARON_CT}
-                )
-                if resp.status_code == 200:
-                    data = baron_pd(resp.content)
-                    bal = data.get(14, b"")
-                    if isinstance(bal, bytes):
-                        bal = bal.decode("utf-8", errors="ignore")
-                    elif isinstance(bal, int):
-                        bal = str(bal)
-                    self.balance_raw = bal
-                    # parse balance
-                    def parse_balance(balance_str, country_code):
-                        currency_symbols = ['$', '€', '£', '¥', '₩', '₽', '₺', '₱', '₦', '₵', '₡', '₴', '₪', '₾', '₸', '₮', '៛', '৳', '﷼', 'د.إ', 'د.ك', 'R$', 'A$', 'C$', 'S$', 'HK$', 'NZ$', 'NT$', 'RM', 'Rp', 'zł', 'Kč', 'Ft', '₨']
-                        symbol = ''
-                        for sym in currency_symbols:
-                            if sym in balance_str:
-                                symbol = sym
-                                break
-                        if not symbol and country_code in CURRENCY_MAP:
-                            symbol = CURRENCY_MAP[country_code]
-                        cleaned = re.sub(r'[^\d.,\-]', '', balance_str)
-                        if ',' in cleaned and '.' not in cleaned:
-                            cleaned = cleaned.replace(',', '.')
-                        parts = cleaned.split('.')
-                        if len(parts) > 2:
-                            cleaned = parts[0] + '.' + ''.join(parts[1:])
-                        try:
-                            value = float(cleaned)
-                        except:
-                            value = 0.0
-                        return value, symbol
-                    self.balance_float, self.currency = parse_balance(bal, self.country)
-            except Exception as e:
-                # Log error but continue – we still have a valid profile
-                pass
-
-            self.success = True
-            return True
-
-        # ---- If profile failed, try the APIs as fallback ----
+        # If profile page failed, we still try APIs, but we need to set username/level later.
+        # We'll consider the account valid if ANY API succeeds.
         any_api_success = False
+
+        # ---- Helper to fetch data from APIs ----
         try:
-            # Helper functions (same as above)
-            def api_get(url, params=None, **kwargs):
-                params = params or {}
-                params['access_token'] = self.token
-                return self.session.get(url, params=params, timeout=10, **kwargs)
-
-            def api_post(url, data=None, **kwargs):
-                sep = '&' if '?' in url else '?'
-                url_with_token = f"{url}{sep}access_token={baro_enc.quote(self.token)}"
-                return self.session.post(url_with_token, data=data, timeout=10, **kwargs)
-
-            # Country
+            # 1. Country
             cpb = struct.pack('<BQ', 0x09, sid_int)
-            resp = api_post(
+            data_enc = base64.b64encode(cpb).decode()
+            resp = self._api_request(
+                'POST',
                 "https://api.steampowered.com/IUserAccountService/GetUserCountry/v1",
-                data=brn_mp("input_protobuf_encoded", base64.b64encode(cpb).decode()),
+                data=brn_mp("input_protobuf_encoded", data_enc),
                 headers={"Content-Type": BARON_CT}
             )
-            if resp.status_code == 200:
+            if resp and resp.status_code == 200:
                 data = baron_pd(resp.content)
                 cc = data.get(1, b"")
                 if cc:
@@ -530,16 +446,17 @@ class SteamChecker:
                     self.country = BRN_MAP.get(cc, cc)
                     any_api_success = True
 
-            # Games
+            # 2. Games list
             gpb = (baro_pi(1, sid_int) + baro_pi(2, 1) + baro_pi(3, 1) +
                    baro_pi(6, 0) + baro_ps(7, "english") + baro_pi(8, 1) +
                    baro_pi(9, 1) + baro_pi(10, 1))
             gb64 = baro_enc.quote(base64.b64encode(gpb).decode())
-            resp = api_get(
+            resp = self._api_request(
+                'GET',
                 "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1",
                 params={"input_protobuf_encoded": gb64}
             )
-            if resp.status_code == 200:
+            if resp and resp.status_code == 200:
                 data = baron_pd(resp.content)
                 self.total_games = data.get(1, 0)
                 any_api_success = True
@@ -561,13 +478,14 @@ class SteamChecker:
                     except:
                         continue
 
-            # Balance
-            resp = api_post(
+            # 3. Balance
+            resp = self._api_request(
+                'POST',
                 "https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1",
                 data=brn_mp("input_protobuf_encoded", "GAE="),
                 headers={"Content-Type": BARON_CT}
             )
-            if resp.status_code == 200:
+            if resp and resp.status_code == 200:
                 data = baron_pd(resp.content)
                 bal = data.get(14, b"")
                 if isinstance(bal, bytes):
@@ -576,6 +494,7 @@ class SteamChecker:
                     bal = str(bal)
                 self.balance_raw = bal
                 any_api_success = True
+                # parse balance
                 def parse_balance(balance_str, country_code):
                     currency_symbols = ['$', '€', '£', '¥', '₩', '₽', '₺', '₱', '₦', '₵', '₡', '₴', '₪', '₾', '₸', '₮', '៛', '৳', '﷼', 'د.إ', 'د.ك', 'R$', 'A$', 'C$', 'S$', 'HK$', 'NZ$', 'NT$', 'RM', 'Rp', 'zł', 'Kč', 'Ft', '₨']
                     symbol = ''
@@ -598,24 +517,35 @@ class SteamChecker:
                     return value, symbol
                 self.balance_float, self.currency = parse_balance(bal, self.country)
 
-            # If any API succeeded, we consider it valid
-            if any_api_success:
-                # Try to get username from profile (optional)
-                try:
+        except Exception as e:
+            # Log error silently; we still might have profile info
+            pass
+
+        # ---- Decide if account is valid ----
+        # If profile page loaded, we consider it valid even if APIs failed.
+        # If profile failed but at least one API succeeded, we still consider it valid.
+        if profile_ok:
+            self.success = True
+            return True
+        elif any_api_success:
+            # We have API data but no profile; try to get username/level from profile anyway
+            try:
+                if not self.username:
                     username = self.get_username_from_profile(sid_int)
                     if username:
                         self.username = username
-                except:
-                    pass
-                if not self.username:
-                    self.username = self.steamid[:8]
-                self.level = self.get_level(sid_int)
-                self.success = True
-                return True
-            else:
-                return False
-
-        except Exception:
+                if not self.level or self.level == "?":
+                    self.level = self.get_level(sid_int)
+            except:
+                pass
+            if not self.username:
+                self.username = self.steamid[:8]
+            if not self.level:
+                self.level = "?"
+            self.success = True
+            return True
+        else:
+            self.success = False
             return False
 
 def generate_hit_content(hit):
@@ -660,7 +590,7 @@ Checked on : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     return content
 
 # ------------------------------------------------------------
-# Telegram Bot and Flask
+# Telegram Bot and Flask (unchanged)
 # ------------------------------------------------------------
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
