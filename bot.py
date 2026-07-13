@@ -13,16 +13,16 @@ import shutil
 import asyncio
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Thread
+from threading import Thread, Lock
 from io import BytesIO
 
 import requests
 from flask import Flask, jsonify
-from telegram import Update, Document
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ------------------------------------------------------------
-# Original SteamChecker code (unchanged, but load_cookies enhanced)
+# Original SteamChecker code (unchanged except load_cookies enhanced)
 # ------------------------------------------------------------
 
 G = "\033[92m"
@@ -173,7 +173,6 @@ def load_cookies(filepath):
     try:
         data = json.loads(content)
         if isinstance(data, list):
-            # list of cookie objects
             cookies = []
             for cookie in data:
                 if 'domain' in cookie and 'name' in cookie and 'value' in cookie:
@@ -192,7 +191,6 @@ def load_cookies(filepath):
             if cookies:
                 return cookies
         elif isinstance(data, dict):
-            # look for a key containing a list of cookies
             for key in ['cookies', 'cookie', 'data', 'cookies_list']:
                 if key in data and isinstance(data[key], list):
                     cookies = []
@@ -548,8 +546,18 @@ def create_zip_from_hits(hits, range_name):
     zip_buffer.seek(0)
     return zip_buffer
 
-def process_cookies(cookie_list):
-    """Process a list of (cookies, filepath) tuples. Returns (valid_hits, invalid_count, error_count)."""
+# Progress tracker class
+class ProgressTracker:
+    def __init__(self, total):
+        self.total = total
+        self.processed = 0
+        self.valid = 0
+        self.invalid = 0
+        self.lock = Lock()
+        self.done = False
+
+# Processing function with progress updates
+def process_cookies_with_progress(cookie_list, tracker):
     checkers = []
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = []
@@ -558,12 +566,17 @@ def process_cookies(cookie_list):
             checkers.append(checker)
             futures.append(executor.submit(checker.check))
         for future in as_completed(futures):
-            pass
-    valid_hits = [c for c in checkers if c.success]
-    invalid_count = len(checkers) - len(valid_hits)
-    error_count = 0  # no separate error tracking
-    return valid_hits, invalid_count, error_count
+            success = future.result()
+            with tracker.lock:
+                tracker.processed += 1
+                if success:
+                    tracker.valid += 1
+                else:
+                    tracker.invalid += 1
+    tracker.done = True
+    return [c for c in checkers if c.success]
 
+# Bot handlers
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     if not document or not document.file_name.endswith('.zip'):
@@ -581,7 +594,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with zipfile.ZipFile(zip_path, 'r') as zf:
             zf.extractall(extract_dir)
 
-        # Find cookie files
         cookie_files = []
         for root, _, files in os.walk(extract_dir):
             for f in files:
@@ -594,7 +606,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(zip_path)
             return
 
-        # Load cookies from each file
         all_cookies = []
         for filepath in cookie_files:
             cookies = load_cookies(filepath)
@@ -610,13 +621,33 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = len(all_cookies)
         await status_msg.edit_text(f"✅ Loaded {total} cookie sets. Starting check...")
 
-        # Process in a separate thread
+        tracker = ProgressTracker(total)
         loop = asyncio.get_running_loop()
-        valid_hits, invalid_count, error_count = await loop.run_in_executor(
-            None, process_cookies, all_cookies
-        )
 
-        await status_msg.edit_text(f"✅ Checking completed: {total} total, {len(valid_hits)} valid, {invalid_count} invalid.")
+        # Start processing in thread
+        processing_future = loop.run_in_executor(None, process_cookies_with_progress, all_cookies, tracker)
+
+        # Updater task
+        async def status_updater():
+            while not tracker.done:
+                with tracker.lock:
+                    processed = tracker.processed
+                    valid = tracker.valid
+                    invalid = tracker.invalid
+                await status_msg.edit_text(f"🔄 Checking... {processed}/{total} | ✅ Valid: {valid} | ❌ Invalid: {invalid}")
+                await asyncio.sleep(1)
+            # final update
+            with tracker.lock:
+                processed = tracker.processed
+                valid = tracker.valid
+                invalid = tracker.invalid
+            await status_msg.edit_text(f"✅ Checking completed: {total} total, {valid} valid, {invalid} invalid.")
+
+        # Run both concurrently
+        await asyncio.gather(processing_future, status_updater())
+
+        # Get valid hits
+        valid_hits = processing_future.result()
 
         if not valid_hits:
             await update.message.reply_text("❌ No valid Steam accounts found.")
