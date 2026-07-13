@@ -161,7 +161,8 @@ def load_cookies(filepath):
     Load cookies from a file. Supports:
     - JSON array of cookie objects
     - JSON object with a 'cookies' or 'data' list
-    - Netscape format (tab-separated, starting with #)
+    - Netscape format (tab-separated, starting with domain)
+    - Mixed text files that contain Netscape lines among other text
     """
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
@@ -213,14 +214,31 @@ def load_cookies(filepath):
     except:
         pass
 
-    # Try Netscape format
-    try:
-        lines = content.splitlines()
+    # Try to find Netscape-style cookie lines (tab-separated, at least 7 fields)
+    # This works even if there is extra text before/after.
+    lines = content.splitlines()
+    cookie_lines = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split('\t')
+        if len(parts) >= 7:
+            # Check if first part looks like a domain (contains a dot or is 'localhost')
+            domain = parts[0]
+            if '.' in domain or domain == 'localhost':
+                cookie_lines.append(line)
+        # Also check if line contains "steamLoginSecure" or "steamRefresh_steam" as a name
+        elif 'steamLoginSecure' in line or 'steamRefresh_steam' in line:
+            # Might be a cookie line but with different separators? Try splitting by whitespace?
+            # We'll attempt to split by tabs anyway
+            parts = line.split('\t')
+            if len(parts) >= 7:
+                cookie_lines.append(line)
+
+    if cookie_lines:
         cookies = []
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
+        for line in cookie_lines:
             parts = line.split('\t')
             if len(parts) >= 7:
                 domain, flag, path, secure, expires, name, value = parts[:7]
@@ -236,8 +254,6 @@ def load_cookies(filepath):
                 })
         if cookies:
             return cookies
-    except:
-        pass
 
     return None
 
@@ -345,6 +361,7 @@ class SteamChecker:
         self.steamid = self.extract_steamid()
         self.token = self.extract_token()
 
+        # Must have both a valid steamid and token
         if not self.steamid or not self.token:
             return False
 
@@ -610,10 +627,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for filepath in cookie_files:
             cookies = load_cookies(filepath)
             if cookies:
-                all_cookies.append((cookies, filepath))
+                # Verify that we have at least one essential cookie
+                essential_names = {'steamLoginSecure', 'steamRefresh_steam'}
+                has_essential = any(c.get('name') in essential_names for c in cookies)
+                if has_essential:
+                    all_cookies.append((cookies, filepath))
+                else:
+                    # Optional: log skipping
+                    pass
 
         if not all_cookies:
-            await status_msg.edit_text("❌ Failed to load any valid cookies from the files. Please ensure they are in JSON or Netscape format.")
+            await status_msg.edit_text("❌ Failed to load any valid cookies from the files. Ensure they contain 'steamLoginSecure' or 'steamRefresh_steam'.")
             shutil.rmtree(extract_dir)
             os.remove(zip_path)
             return
