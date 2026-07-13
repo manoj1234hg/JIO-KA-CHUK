@@ -22,7 +22,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ------------------------------------------------------------
-# Original SteamChecker code (unchanged except load_cookies enhanced)
+# Original SteamChecker code (unchanged)
 # ------------------------------------------------------------
 
 G = "\033[92m"
@@ -627,21 +627,34 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Start processing in thread
         processing_future = loop.run_in_executor(None, process_cookies_with_progress, all_cookies, tracker)
 
-        # Updater task
+        # Updater task with duplicate prevention
+        last_text = ""
         async def status_updater():
+            nonlocal last_text
             while not tracker.done:
                 with tracker.lock:
                     processed = tracker.processed
                     valid = tracker.valid
                     invalid = tracker.invalid
-                await status_msg.edit_text(f"🔄 Checking... {processed}/{total} | ✅ Valid: {valid} | ❌ Invalid: {invalid}")
+                new_text = f"🔄 Checking... {processed}/{total} | ✅ Valid: {valid} | ❌ Invalid: {invalid}"
+                if new_text != last_text:
+                    try:
+                        await status_msg.edit_text(new_text)
+                        last_text = new_text
+                    except Exception:
+                        pass
                 await asyncio.sleep(1)
             # final update
             with tracker.lock:
                 processed = tracker.processed
                 valid = tracker.valid
                 invalid = tracker.invalid
-            await status_msg.edit_text(f"✅ Checking completed: {total} total, {valid} valid, {invalid} invalid.")
+            final_text = f"✅ Checking completed: {total} total, {valid} valid, {invalid} invalid."
+            if final_text != last_text:
+                try:
+                    await status_msg.edit_text(final_text)
+                except Exception:
+                    pass
 
         # Run both concurrently
         await asyncio.gather(processing_future, status_updater())
