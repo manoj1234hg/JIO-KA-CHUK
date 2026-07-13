@@ -794,7 +794,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Send me a ZIP file containing Steam cookie files (JSON or TXT).\n"
+        "👋 Send me a ZIP's file containing Steam cookie files (JSON or TXT).\n"
         "I will check each cookie and send back valid accounts grouped by balance ranges.\n"
         "Balance ranges: 0-1, 1-5, 5-10, 10-200 (and others).\n"
         "Currency symbols are detected automatically."
