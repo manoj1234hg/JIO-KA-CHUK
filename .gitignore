@@ -1,39 +1,28 @@
-# Python cache
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-
-# Virtual environment
-venv/
+*.so
+.Python
 env/
-.venv/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
-# Environment variables
-.env
-
-# Logs
+# Logs and data
+BomBX-Logs.txt
 *.log
-
-# Temporary files
-tmp/
-temp/
 *.tmp
-
-# Bot generated files
-*.zip
-*.txt
-*.json
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# OS files
-.DS_Store
-Thumbs.db
+# Environment variables
+.env
+.env.local
 
-# Secrets
-config.py
-token.txt
-*.key
-*.pem
+# Render deployment (optional)
+*.pid
