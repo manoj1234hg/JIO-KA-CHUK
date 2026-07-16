@@ -40,21 +40,21 @@ ORIGINAL_API_CONFIG = {
             "type": "sms",
             "method": "GET",
             "url": "https://www.healthkart.com/veronica/user/validate/1/{phone}/signup?plt=1&st=1",
-            "sleep": 20
+            "sleep": 5
         },
         "NNNOW": {
             "type": "sms",
             "method": "POST",
             "url": "https://api.nnnow.com/m/mobapi/otp/generateOtp/v1/flash",
             "data": {"mobileNumber": "{phone}"},
-            "sleep": 20
+            "sleep": 5
         },
         "Shiprocket": {
             "type": "sms",
             "method": "POST",
             "url": "https://apiv2.shiprocket.in/v1/auth/login/quick",
             "data": {"mobile": "{phone}", "device_id": "LQ3.981019.001"},
-            "sleep": 20
+            "sleep": 5
         },
         "MeeHelp": {
             "type": "sms",
@@ -66,7 +66,7 @@ ORIGINAL_API_CONFIG = {
                 "accept-encoding": "gzip",
                 "host": "meehelp.co.in"
             },
-            "sleep": 20
+            "sleep": 5
         },
         "Nathabit_WhatsApp": {
             "type": "whatsapp",
@@ -81,7 +81,7 @@ ORIGINAL_API_CONFIG = {
             },
             "cookies": {"cust_cart": "kT7wRpLmXv3hQdNs9YeJ"},
             "data": {"phone": "{phone}", "send_on_whatsapp": True, "address_consent": True},
-            "sleep": 30
+            "sleep": 10
         }
     }
 }
