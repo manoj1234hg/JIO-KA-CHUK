@@ -14,7 +14,7 @@ WEBHOOK_URLS = [
 ]
 DB_FILE = "gift_codes.db"
 CODE_LENGTH = 16
-DELAY_PER_LINK = 0.2   # seconds (5 links per second per webhook)
+DELAY_PER_LINK = 0.01   # 10 milliseconds (WARNING: will exceed Discord rate limit!)
 
 # ------------------ Database Setup ------------------
 def init_db():
@@ -85,20 +85,21 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# ------------------ Main Loop (One by One) ------------------
+# ------------------ Main Loop ------------------
 def gift_loop():
     while True:
         code = generate_unique_code()
         link = f"https://discord.gift/{code}"
         send_link_to_all(link)
-        time.sleep(DELAY_PER_LINK)   # wait 0.2 sec before next link
+        time.sleep(DELAY_PER_LINK)   # 10 ms delay
 
 def main():
     init_db()
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print(f"Flask server running on port {os.environ.get('PORT', 8080)}")
-    print(f"Gift link generator started – sending each link to {len(WEBHOOK_URLS)} webhooks with {DELAY_PER_LINK}s delay. Press Ctrl+C to stop.")
+    print(f"Gift link generator started – sending each link to {len(WEBHOOK_URLS)} webhooks with {DELAY_PER_LINK}s delay.")
+    print("WARNING: 10ms delay will cause rate limit errors (429) from Discord!")
     try:
         gift_loop()
     except KeyboardInterrupt:
