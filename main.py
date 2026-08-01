@@ -8,11 +8,13 @@ from flask import Flask, jsonify
 import requests
 
 # ------------------ Configuration ------------------
-WEBHOOK_URL = "https://discord.com/api/webhooks/1533131974825476156/ua5DRmLZacxJ43VW0NdiXMVUkFMW-j2qUceOjM0XH71HpKgcdzu1fmFpY_l-um2n5p-D"
+WEBHOOK_URLS = [
+    "https://discord.com/api/webhooks/1533131974825476156/ua5DRmLZacxJ43VW0NdiXMVUkFMW-j2qUceOjM0XH71HpKgcdzu1fmFpY_l-um2n5p-D",
+    "https://discord.com/api/webhooks/1533135055751352360/BM7bx2TvRx0FBxAqN5_9Eij6mhfKLEBk22ObKPnpLvvGPGknP6M0VPtHkqWI9Iq_DFn3"
+]
 DB_FILE = "gift_codes.db"
 CODE_LENGTH = 16
-# Discord rate limit: 5 requests/sec per webhook, so we use 0.2 sec delay
-DELAY_PER_LINK = 0.2   # seconds
+DELAY_PER_LINK = 0.2   # seconds (5 links per second per webhook)
 
 # ------------------ Database Setup ------------------
 def init_db():
@@ -52,15 +54,16 @@ def generate_unique_code():
             mark_code_used(code)
             return code
 
-# ------------------ Webhook Sending (Single Link) ------------------
-def send_link(link):
-    payload = {"content": link}   # Sirf link bhej rahe hain, extra text nahi
-    try:
-        resp = requests.post(WEBHOOK_URL, json=payload)
-        resp.raise_for_status()
-        print(f"[{time.ctime()}] Sent: {link}")
-    except Exception as e:
-        print(f"Error sending {link}: {e}")
+# ------------------ Webhook Sending (to all webhooks) ------------------
+def send_link_to_all(link):
+    for url in WEBHOOK_URLS:
+        payload = {"content": link}
+        try:
+            resp = requests.post(url, json=payload)
+            resp.raise_for_status()
+            print(f"[{time.ctime()}] Sent to {url.split('/')[-1]}: {link}")
+        except Exception as e:
+            print(f"Error sending to {url}: {e}")
 
 # ------------------ Flask App ------------------
 flask_app = Flask(__name__)
@@ -87,15 +90,15 @@ def gift_loop():
     while True:
         code = generate_unique_code()
         link = f"https://discord.gift/{code}"
-        send_link(link)
-        time.sleep(DELAY_PER_LINK)   # 0.2 sec => 5 links per second
+        send_link_to_all(link)
+        time.sleep(DELAY_PER_LINK)   # wait 0.2 sec before next link
 
 def main():
     init_db()
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print(f"Flask server running on port {os.environ.get('PORT', 8080)}")
-    print("Gift link generator started (one link at a time, 5 per second). Press Ctrl+C to stop.")
+    print(f"Gift link generator started – sending each link to {len(WEBHOOK_URLS)} webhooks with {DELAY_PER_LINK}s delay. Press Ctrl+C to stop.")
     try:
         gift_loop()
     except KeyboardInterrupt:
