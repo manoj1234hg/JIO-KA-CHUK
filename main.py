@@ -4,6 +4,7 @@ import time
 import os
 import threading
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify
 import requests
 
@@ -14,7 +15,7 @@ WEBHOOK_URLS = [
 ]
 DB_FILE = "gift_codes.db"
 CODE_LENGTH = 16
-DELAY_PER_CYCLE = 0.01   # 10 milliseconds per cycle (sends one link to each webhook)
+DELAY_PER_CYCLE = 0.01   # 10 milliseconds per cycle (all webhooks sent in parallel)
 
 # ------------------ Database Setup ------------------
 def init_db():
@@ -54,7 +55,7 @@ def generate_unique_code():
             mark_code_used(code)
             return code
 
-# ------------------ Webhook Sending ------------------
+# ------------------ Webhook Sending (Threaded) ------------------
 def send_link_to_webhook(url, link):
     payload = {"content": link}
     try:
@@ -63,6 +64,16 @@ def send_link_to_webhook(url, link):
         print(f"[{time.ctime()}] Sent to {url.split('/')[-1]}: {link}")
     except Exception as e:
         print(f"Error sending to {url}: {e}")
+
+def send_all_links(links):
+    """Send each link to its corresponding webhook in parallel using threads."""
+    with ThreadPoolExecutor(max_workers=len(WEBHOOK_URLS)) as executor:
+        futures = []
+        for url, link in zip(WEBHOOK_URLS, links):
+            futures.append(executor.submit(send_link_to_webhook, url, link))
+        # Optionally wait for all to complete (not required, but we can)
+        for f in futures:
+            f.result()  # This will raise any exception from the thread
 
 # ------------------ Flask App ------------------
 flask_app = Flask(__name__)
@@ -87,15 +98,14 @@ def run_flask():
 # ------------------ Main Loop ------------------
 def gift_loop():
     while True:
-        # Generate a unique link for each webhook
+        # Generate unique links – one per webhook
         links = []
         for _ in WEBHOOK_URLS:
             code = generate_unique_code()
             links.append(f"https://discord.gift/{code}")
         
-        # Send each link to its respective webhook
-        for url, link in zip(WEBHOOK_URLS, links):
-            send_link_to_webhook(url, link)
+        # Send all links in parallel
+        send_all_links(links)
         
         # Wait 10ms before next cycle
         time.sleep(DELAY_PER_CYCLE)
@@ -105,8 +115,8 @@ def main():
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print(f"Flask server running on port {os.environ.get('PORT', 8080)}")
-    print(f"Gift link generator started – each cycle sends {len(WEBHOOK_URLS)} unique links (one per webhook) with {DELAY_PER_CYCLE}s delay.")
-    print("WARNING: 10ms delay will cause severe rate limit errors (429) from Discord!")
+    print(f"Gift link generator started – each cycle generates {len(WEBHOOK_URLS)} unique links and sends them in parallel (threaded).")
+    print(f"Delay per cycle: {DELAY_PER_CYCLE}s. WARNING: This will exceed Discord rate limit (5 req/sec per webhook)!")
     try:
         gift_loop()
     except KeyboardInterrupt:
